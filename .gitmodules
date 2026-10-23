@@ -1,0 +1,3 @@
+[submodule "firmware/components/bmd/blackmagic"]
+	path = firmware/components/bmd/blackmagic
+	url = https://codeberg.org/blackmagic-debug/blackmagic.git
