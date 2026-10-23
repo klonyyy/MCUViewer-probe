@@ -1,0 +1,40 @@
+menu "MVProbe network"
+
+    config MVPROBE_WIFI_SSID
+        string "Wi-Fi SSID (station mode)"
+        default ""
+        help
+            Network to join. Leave empty to always start the fallback access point.
+            Put real credentials in firmware/sdkconfig.local (git-ignored), not in
+            sdkconfig.defaults.
+
+    config MVPROBE_WIFI_PASSWORD
+        string "Wi-Fi password (station mode)"
+        default ""
+
+    config MVPROBE_WIFI_STA_TIMEOUT_MS
+        int "Station connect timeout before AP fallback (ms)"
+        range 1000 120000
+        default 15000
+
+    config MVPROBE_AP_SSID
+        string "Fallback access point SSID"
+        default "mvprobe"
+
+    config MVPROBE_AP_PASSWORD
+        string "Fallback access point password"
+        default ""
+        help
+            WPA2 password, at least 8 characters. Anything shorter starts an OPEN
+            access point.
+
+    config MVPROBE_AP_CHANNEL
+        int "Fallback access point channel"
+        range 1 13
+        default 6
+
+    config MVPROBE_HOSTNAME
+        string "Hostname (DHCP and mDNS)"
+        default "mvprobe"
+
+endmenu
