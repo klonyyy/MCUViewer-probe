@@ -20,3 +20,6 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 
 # Wi-Fi throughput over power saving
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+
+# Streaming: throughput is about the send buffer divided by the RTT, and Wi-Fi RTTs spike
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768

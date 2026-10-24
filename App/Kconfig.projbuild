@@ -1,6 +1,6 @@
-menu "MVProbe network"
+menu "NETWORK PROBE network"
 
-    config MVPROBE_WIFI_SSID
+    config NETWORK_PROBE_WIFI_SSID
         string "Wi-Fi SSID (station mode)"
         default ""
         help
@@ -8,33 +8,50 @@ menu "MVProbe network"
             Put real credentials in sdkconfig.local (git-ignored), not in
             sdkconfig.defaults.
 
-    config MVPROBE_WIFI_PASSWORD
+    config NETWORK_PROBE_WIFI_PASSWORD
         string "Wi-Fi password (station mode)"
         default ""
 
-    config MVPROBE_WIFI_STA_TIMEOUT_MS
+    config NETWORK_PROBE_WIFI_STA_TIMEOUT_MS
         int "Station connect timeout before AP fallback (ms)"
         range 1000 120000
         default 15000
 
-    config MVPROBE_AP_SSID
+    config NETWORK_PROBE_AP_SSID
         string "Fallback access point SSID"
-        default "mvprobe"
+        default "network-probe"
 
-    config MVPROBE_AP_PASSWORD
+    config NETWORK_PROBE_AP_PASSWORD
         string "Fallback access point password"
         default ""
         help
             WPA2 password, at least 8 characters. Anything shorter starts an OPEN
             access point.
 
-    config MVPROBE_AP_CHANNEL
+    config NETWORK_PROBE_AP_CHANNEL
         int "Fallback access point channel"
         range 1 13
         default 6
 
-    config MVPROBE_HOSTNAME
+    config NETWORK_PROBE_HOSTNAME
         string "Hostname (DHCP and mDNS)"
-        default "mvprobe"
+        default "network-probe"
+
+    config NETWORK_PROBE_PORT
+        int "NETWORK PROBE protocol TCP port (MCUViewer)"
+        range 1 65535
+        default 2023
+        help
+            Port of the NETWORK PROBE protocol server. MCUViewer connects here.
+            Announced over mDNS as _network-probe._tcp.
+
+    config NETWORK_PROBE_STREAM_BUFFER_KB
+        int "Streaming sample buffer (KiB)"
+        range 16 1536
+        default 1024
+        help
+            Ring buffer between sampling and the network, in PSRAM. It bridges
+            Wi-Fi stalls: at 48 bytes per sample and 3 kHz, 1 MiB holds about 7 s.
+            Without PSRAM a 32 KiB buffer in internal RAM is used.
 
 endmenu

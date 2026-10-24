@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -10,11 +10,17 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+extern "C"
+{
+#include "general.h"
+#include "platform.h"
+}
+
 App app;
 
 namespace
 {
-constexpr const char* tag = "mvprobe";
+constexpr const char* tag = "network_probe";
 }  // namespace
 
 void App::init()
@@ -35,5 +41,31 @@ void App::init()
 
 void App::probeTask(void* arg)
 {
-	static_cast<App*>(arg)->gdbServer.run();
+	static_cast<App*>(arg)->runProbe();
+}
+
+void App::runProbe()
+{
+	/* Must run on the core that owns SWD: it creates the dedicated GPIO bundle */
+	platform_init();
+	gdbServer.init();
+	hostLink.probeTask = xTaskGetCurrentTaskHandle();
+	probeService.init(hostLink);
+	netServer.start(hostLink, gdbServer.getListenSocket());
+
+	while (true)
+	{
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		probeService.service();
+
+		// Check if GDB has been requested by the host
+		if (hostLink.gdbRequested.load(std::memory_order_acquire))
+		{
+			hostLink.gdbActive.store(true, std::memory_order_release);
+			gdbServer.serve();
+			hostLink.gdbActive.store(false, std::memory_order_release);
+			hostLink.gdbRequested.store(false, std::memory_order_release);
+			hostLink.wakeNet();
+		}
+	}
 }

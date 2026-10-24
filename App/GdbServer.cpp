@@ -1,15 +1,17 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * The loop is adapted from src/main.c of Black Magic Debug:
  *   Copyright (C) 2011  Black Sphere Technologies Ltd.
  *   Written by Gareth McMullin <gareth@blacksphere.co.nz>
  * It is reimplemented here instead of linking main.c, which defines main() and never
- * returns, so that the probe can later leave GDB mode for the streaming mode.
+ * returns, so that the probe can leave GDB mode between sessions and serve MCUViewer.
  */
 
 #include "GdbServer.hpp"
+
+#include "GdbTcpInterface.hpp"
 
 extern "C"
 {
@@ -23,15 +25,23 @@ extern "C"
 #include "target.h"
 }
 
-void GdbServer::run()
+void GdbServer::init()
 {
-	/* Must run on the core that owns SWD: it creates the dedicated GPIO bundle */
-	platform_init();
-
 	while (gdb_if_init() != 0)
 		platform_delay(1000);
+}
 
-	while (true)
+int GdbServer::getListenSocket() const
+{
+	return gdbTcpInterface.getListenSocket();
+}
+
+void GdbServer::serve()
+{
+	if (!gdbTcpInterface.acceptClient())
+		return;
+
+	while (gdbTcpInterface.isSessionOpen())
 	{
 		TRY(EXCEPTION_ALL)
 		{

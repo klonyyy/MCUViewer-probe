@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -9,11 +9,14 @@
 #include <stdint.h>
 
 #include "GdbServer.hpp"
+#include "HostLink.hpp"
+#include "NetServer.hpp"
+#include "ProbeService.hpp"
 #include "Wifi.hpp"
 
 /**
- * @brief MVProbe: wireless SWD probe for MCUViewer, built on Black Magic Debug. Owns the network and the SWD owner
- * task.
+ * @brief NETWORK PROBE: wireless SWD probe for MCUViewer, built on Black Magic Debug. Owns the network, the net task and the
+ * SWD owner task.
  */
 class App
 {
@@ -30,8 +33,18 @@ class App
 
 	static void probeTask(void* arg);
 
+	/**
+	 * @brief Body of the SWD owner task: serves what the net task hands over, NETWORK PROBE requests and streaming, or a GDB
+	 * client. The two never share the SWD lines: the net task hands over a GDB client only while no NETWORK PROBE client is
+	 * connected, and answers NETWORK PROBE requests BUSY during a GDB session.
+	 */
+	[[noreturn]] void runProbe();
+
 	Wifi wifi;
 	GdbServer gdbServer;
+	HostLink hostLink;
+	ProbeService probeService;
+	NetServer netServer;
 };
 
 extern App app;

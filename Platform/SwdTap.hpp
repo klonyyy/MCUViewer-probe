@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -18,14 +18,7 @@
 class SwdTap
 {
    public:
-	/**
-	 * @brief Counters of the tap primitives, to measure the SWCLK frequency they actually produce.
-	 */
-	struct Stats
-	{
-		uint64_t clocks; /**< SWCLK cycles emitted. */
-		uint64_t cycles; /**< CPU cycles spent inside the tap primitives. */
-	};
+	static constexpr uint32_t minFrequency = 1000; /**< setFrequency() clamps lower requests to this. */
 
 	/**
 	 * @brief Takes SWCLK and SWDIO, releases both lines, measures the fastest SWCLK the loop can produce and points
@@ -45,24 +38,14 @@ class SwdTap
 	static uint32_t getFrequency();
 
 	/**
-	 * @brief Gets the CPU cycles per SWCLK half period, 0 when the loop runs as fast as it can.
+	 * @brief Gets the fastest SWCLK the loop can produce, measured at init.
 	 */
-	static uint32_t getHalfPeriodCycles() { return halfPeriod; }
-
-	static uint32_t getCpuFrequency() { return cpuFrequency; }
-
-	/**
-	 * @brief Gets the free-running CPU cycle counter of the calling core.
-	 */
-	static uint32_t getCycleCount();
+	static uint32_t getMaxFrequency() { return maxFrequency; }
 
 	/**
 	 * @brief Drives (true) or releases (false) SWCLK and SWDIO.
 	 */
 	static void setDriveEnabled(bool enable);
-
-	static Stats getStats() { return stats; }
-	static void resetStats() { stats = {}; }
 
 	/* swd_proc primitives, see BMD's swd.h. Each one ends with a falling SWCLK edge. */
 	static uint32_t seqIn(size_t clockCycles);
@@ -76,11 +59,8 @@ class SwdTap
 
 	/**
 	 * @brief Turns SWDIO around if its direction differs from drive.
-	 * @return Clock cycles spent, 0 or 1.
 	 */
-	static size_t turnaround(bool drive, uint32_t half);
-
-	static void addStats(uint32_t start, size_t clocks);
+	static void turnaround(bool drive, uint32_t half);
 
 	/**
 	 * @brief Runs the output loop at full speed with both pins released.
@@ -97,7 +77,6 @@ class SwdTap
 	static inline uint32_t halfPeriod = 0;	 /**< CPU cycles per SWCLK half period, 0 = as fast as the loop runs. */
 	static inline uint32_t maxFrequency = 0; /**< Fastest SWCLK the loop can produce, measured at init. */
 	static inline bool swdioDriven = false;
-	static inline Stats stats{};
 };
 
 #endif /* SWDTAP_HPP */

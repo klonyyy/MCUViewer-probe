@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * GDB remote serial protocol transport over TCP (one client at a time), BMD's gdb_if.
@@ -9,15 +9,14 @@
  * so gdb_main() detaches from the target.
  */
 
+#include "GdbTcpInterface.hpp"
+
 #include <errno.h>
 #include <stdint.h>
 
 #include <algorithm>
-#include <array>
 
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
 
@@ -30,55 +29,7 @@ extern "C"
 namespace
 {
 constexpr const char* tag = "gdb_if";
-
-/**
- * @brief The listening socket and the one client connection, with BMD's character I/O buffered on top.
- */
-class GdbTcpInterface
-{
-   public:
-	/**
-	 * @return 0 once the server listens, -1 on failure.
-	 */
-	int init();
-
-	/**
-	 * @brief Waits for the next character, accepting a client first if there is none.
-	 * @return The character, or EOT ('\x04') once after the client went away.
-	 */
-	char getChar();
-
-	/**
-	 * @return The next character, EOT while the client is gone, or -1 if nothing came within timeout milliseconds.
-	 */
-	char getCharTimeout(uint32_t timeout);
-
-	void putChar(char c, bool flushNow);
-	void flush();
-
-   private:
-	static constexpr size_t bufferSize = 1024;
-
-	void acceptClient();
-	void disconnectClient();
-
-	/**
-	 * @brief Refills the receive buffer. timeoutMs < 0 blocks.
-	 * @return False on timeout or when the connection was lost.
-	 */
-	bool receive(int32_t timeoutMs);
-
-	int listenSocket = -1;
-	int clientSocket = -1;
-	bool eotPending = false; /**< Set when the client goes away, cleared once getChar() has delivered the EOT. */
-
-	std::array<char, bufferSize> rxBuffer;
-	size_t rxLength = 0;
-	size_t rxIndex = 0;
-
-	std::array<char, bufferSize> txBuffer;
-	size_t txLength = 0;
-};
+}  // namespace
 
 GdbTcpInterface gdbTcpInterface;
 
@@ -96,17 +47,17 @@ int GdbTcpInterface::init()
 
 	sockaddr_in address = {};
 	address.sin_family = AF_INET;
-	address.sin_port = htons(CONFIG_MVPROBE_GDB_PORT);
+	address.sin_port = htons(CONFIG_NETWORK_PROBE_GDB_PORT);
 	address.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(listenSocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 || listen(listenSocket, 1) != 0)
 	{
-		ESP_LOGE(tag, "bind/listen on port %d failed: errno %d", CONFIG_MVPROBE_GDB_PORT, errno);
+		ESP_LOGE(tag, "bind/listen on port %d failed: errno %d", CONFIG_NETWORK_PROBE_GDB_PORT, errno);
 		close(listenSocket);
 		listenSocket = -1;
 		return -1;
 	}
 
-	ESP_LOGI(tag, "GDB server listening on TCP port %d", CONFIG_MVPROBE_GDB_PORT);
+	ESP_LOGI(tag, "GDB server listening on TCP port %d", CONFIG_NETWORK_PROBE_GDB_PORT);
 	return 0;
 }
 
@@ -125,35 +76,36 @@ void GdbTcpInterface::disconnectClient()
 	eotPending = true;
 }
 
-void GdbTcpInterface::acceptClient()
+bool GdbTcpInterface::acceptClient()
 {
-	while (clientSocket < 0)
+	if (clientSocket >= 0)
+		return true;
+
+	sockaddr_in peer;
+	socklen_t peerLength = sizeof(peer);
+	const int sock = accept(listenSocket, reinterpret_cast<sockaddr*>(&peer), &peerLength);
+	if (sock < 0)
 	{
-		sockaddr_in peer;
-		socklen_t peerLength = sizeof(peer);
-		const int sock = accept(listenSocket, reinterpret_cast<sockaddr*>(&peer), &peerLength);
-		if (sock < 0)
-		{
-			ESP_LOGW(tag, "accept() failed: errno %d", errno);
-			vTaskDelay(pdMS_TO_TICKS(100));
-			continue;
-		}
-
-		const int one = 1;
-		const int keepaliveIdle = 5;
-		const int keepaliveInterval = 2;
-		const int keepaliveCount = 3;
-		setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-		setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-		setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepaliveIdle, sizeof(keepaliveIdle));
-		setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepaliveInterval, sizeof(keepaliveInterval));
-		setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepaliveCount, sizeof(keepaliveCount));
-
-		char peerName[16];
-		inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
-		ESP_LOGI(tag, "GDB client connected from %s", peerName);
-		clientSocket = sock;
+		ESP_LOGW(tag, "accept() failed: errno %d", errno);
+		return false;
 	}
+
+	const int one = 1;
+	const int keepaliveIdle = 5;
+	const int keepaliveInterval = 2;
+	const int keepaliveCount = 3;
+	setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+	setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepaliveIdle, sizeof(keepaliveIdle));
+	setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepaliveInterval, sizeof(keepaliveInterval));
+	setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepaliveCount, sizeof(keepaliveCount));
+
+	char peerName[16];
+	inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
+	ESP_LOGI(tag, "GDB client connected from %s", peerName);
+	clientSocket = sock;
+	eotPending = false;
+	return true;
 }
 
 bool GdbTcpInterface::receive(const int32_t timeoutMs)
@@ -199,10 +151,10 @@ char GdbTcpInterface::getChar()
 		}
 		if (rxIndex < rxLength)
 			return rxBuffer[rxIndex++];
+		/* The session is over: the SWD owner task accepts the next client itself */
 		if (clientSocket < 0)
-			acceptClient();
-		else
-			receive(-1);
+			return '\x04';
+		receive(-1);
 	}
 }
 
@@ -252,7 +204,6 @@ void GdbTcpInterface::putChar(const char c, const bool flushNow)
 	if (flushNow || txLength == txBuffer.size())
 		flush();
 }
-}  // namespace
 
 int gdb_if_init(void)
 {

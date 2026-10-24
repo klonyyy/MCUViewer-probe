@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * The probe has no JTAG pins. BMD still links its JTAG scan code (monitor jtag_scan,

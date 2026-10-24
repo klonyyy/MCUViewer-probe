@@ -9,5 +9,8 @@
     },
     "[cpp]": {
         "editor.inlayHints.enabled": "off"
-    }
+    },
+    "idf.flashType": "UART",
+    "idf.currentSetup": "C:\\Espressif\\v6.1\\esp-idf",
+    "idf.port": "COM11"
 }

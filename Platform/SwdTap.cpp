@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Timing follows the convention of BMD's generic tap (src/platforms/common/swdptap.c):
@@ -39,8 +39,8 @@ extern "C"
 
 namespace
 {
-constexpr int swclkGpio = CONFIG_MVPROBE_SWCLK_GPIO;
-constexpr int swdioGpio = CONFIG_MVPROBE_SWDIO_GPIO;
+constexpr int swclkGpio = CONFIG_NETWORK_PROBE_SWCLK_GPIO;
+constexpr int swdioGpio = CONFIG_NETWORK_PROBE_SWDIO_GPIO;
 
 constexpr size_t calibrationClocks = 256;
 
@@ -49,12 +49,14 @@ constexpr const char* tag = "swd_tap";
 /* Wait until one half period after the previous edge, return the time of the new edge */
 [[gnu::always_inline]] inline uint32_t waitHalfPeriod(uint32_t edge, const uint32_t half)
 {
+	/* Schedule the next edge relative to the previous one. */
 	edge += half;
 	uint32_t now;
 	do
 	{
 		now = esp_cpu_get_cycle_count();
 	} while (static_cast<int32_t>(now - edge) < 0);
+	/* If we were delayed, restart the schedule here instead of catching up. */
 	if (now - edge > (half >> 1U))
 		edge = now;
 	return edge;
@@ -71,23 +73,23 @@ void swdptap_init(void)
 	swd_proc.seq_out_parity = SwdTap::seqOutParity;
 }
 
-[[gnu::always_inline]] inline void SwdTap::addStats(const uint32_t start, const size_t clocks)
-{
-	stats.cycles += esp_cpu_get_cycle_count() - start;
-	stats.clocks += clocks;
-}
-
 IRAM_ATTR void SwdTap::seqOutRaw(uint32_t value, const size_t clockCycles, const uint32_t half)
 {
 	uint32_t edge = esp_cpu_get_cycle_count();
 	for (size_t cycle = 0; cycle < clockCycles; ++cycle)
 	{
+		/* Set SWDIO according to the LSB of value and drive SWCLK low */
 		dedic_gpio_cpu_ll_write_mask(clkMask | dioMask, (value & 1U) ? dioMask : 0U);
+		/* Shift value to prepare the next bit for output */
 		value >>= 1U;
+		/* wait for the first half period */
 		edge = waitHalfPeriod(edge, half);
+		/* Drive SWCLK high for the second half period */
 		dedic_gpio_cpu_ll_write_mask(clkMask, clkMask);
+		/* wait for the second half period */
 		edge = waitHalfPeriod(edge, half);
 	}
+	/* Release SWDIO and drive SWCLK low at the end of the sequence */
 	dedic_gpio_cpu_ll_write_mask(clkMask, 0U);
 }
 
@@ -97,22 +99,25 @@ IRAM_ATTR uint32_t SwdTap::seqInRaw(const size_t clockCycles, const uint32_t hal
 	uint32_t value = 0;
 	for (size_t cycle = 0; cycle < clockCycles; ++cycle)
 	{
+		/* Sample SWDIO while SWCLK is low, immediately before the rising edge. */
 		edge = waitHalfPeriod(edge, half);
 		const uint32_t bit = (dedic_gpio_cpu_ll_read_in() & dioInMask) ? 1U : 0U;
 		dedic_gpio_cpu_ll_write_mask(clkMask, clkMask);
 		value |= bit << cycle;
+		/* Finish the clock with a falling edge before the next bit. */
 		edge = waitHalfPeriod(edge, half);
 		dedic_gpio_cpu_ll_write_mask(clkMask, 0U);
 	}
 	return value;
 }
 
-IRAM_ATTR size_t SwdTap::turnaround(const bool drive, const uint32_t half)
+IRAM_ATTR void SwdTap::turnaround(const bool drive, const uint32_t half)
 {
 	if (drive == swdioDriven)
-		return 0;
+		return;
 	swdioDriven = drive;
 
+	/* Release SWDIO before clocking the turnaround cycle. */
 	if (!drive)
 		GPIO.enable_w1tc = 1U << swdioGpio;
 	uint32_t edge = esp_cpu_get_cycle_count();
@@ -120,51 +125,42 @@ IRAM_ATTR size_t SwdTap::turnaround(const bool drive, const uint32_t half)
 	dedic_gpio_cpu_ll_write_mask(clkMask, clkMask);
 	edge = waitHalfPeriod(edge, half);
 	dedic_gpio_cpu_ll_write_mask(clkMask, 0U);
+	/* Start driving SWDIO only after the turnaround clock is complete. */
 	if (drive)
 		GPIO.enable_w1ts = 1U << swdioGpio;
-	return 1;
 }
 
 IRAM_ATTR uint32_t SwdTap::seqIn(const size_t clockCycles)
 {
-	const uint32_t start = esp_cpu_get_cycle_count();
 	const uint32_t half = halfPeriod;
-	const size_t turnaroundCycles = turnaround(false, half);
-	const uint32_t value = seqInRaw(clockCycles, half);
-	addStats(start, clockCycles + turnaroundCycles);
-	return value;
+	turnaround(false, half);
+	return seqInRaw(clockCycles, half);
 }
 
 IRAM_ATTR bool SwdTap::seqInParity(uint32_t* const ret, const size_t clockCycles)
 {
-	const uint32_t start = esp_cpu_get_cycle_count();
 	const uint32_t half = halfPeriod;
-	size_t turnaroundCycles = turnaround(false, half);
+	turnaround(false, half);
 	const uint32_t value = seqInRaw(clockCycles, half);
 	const uint32_t parity = seqInRaw(1, half);
-	turnaroundCycles += turnaround(true, half);
-	addStats(start, clockCycles + 1 + turnaroundCycles);
+	turnaround(true, half);
 	*ret = value;
 	return static_cast<uint32_t>(__builtin_parity(value)) == parity;
 }
 
 IRAM_ATTR void SwdTap::seqOut(const uint32_t tmsStates, const size_t clockCycles)
 {
-	const uint32_t start = esp_cpu_get_cycle_count();
 	const uint32_t half = halfPeriod;
-	const size_t turnaroundCycles = turnaround(true, half);
+	turnaround(true, half);
 	seqOutRaw(tmsStates, clockCycles, half);
-	addStats(start, clockCycles + turnaroundCycles);
 }
 
 IRAM_ATTR void SwdTap::seqOutParity(const uint32_t tmsStates, const size_t clockCycles)
 {
-	const uint32_t start = esp_cpu_get_cycle_count();
 	const uint32_t half = halfPeriod;
-	const size_t turnaroundCycles = turnaround(true, half);
+	turnaround(true, half);
 	seqOutRaw(tmsStates, clockCycles, half);
 	seqOutRaw(static_cast<uint32_t>(__builtin_parity(tmsStates)), 1, half);
-	addStats(start, clockCycles + 1 + turnaroundCycles);
 }
 
 void SwdTap::setDriveEnabled(const bool enable)
@@ -232,8 +228,8 @@ void SwdTap::setFrequency(uint32_t frequency)
 		halfPeriod = 0;
 		return;
 	}
-	if (frequency < 1000)
-		frequency = 1000;
+	if (frequency < minFrequency)
+		frequency = minFrequency;
 	/* Round up, so the clock never exceeds the request */
 	halfPeriod = (cpuFrequency + 2U * frequency - 1U) / (2U * frequency);
 }
@@ -243,9 +239,4 @@ uint32_t SwdTap::getFrequency()
 	if (!halfPeriod)
 		return maxFrequency;
 	return std::min(cpuFrequency / (2U * halfPeriod), maxFrequency);
-}
-
-uint32_t SwdTap::getCycleCount()
-{
-	return esp_cpu_get_cycle_count();
 }

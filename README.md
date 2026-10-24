@@ -1,46 +1,19 @@
-# MVProbe
+# NETWORK PROBE
 
 Wireless SWD probe on the ESP32-S3 for [MCUViewer](https://github.com/klonyyy/MCUViewer).
 It is built on [Black Magic Debug](https://codeberg.org/blackmagic-debug/blackmagic) (BMD).
 
-The probe has two modes:
+The probe serves two kinds of clients, one session at a time:
 
-- **GDB mode**: BMD's GDB server over Wi-Fi. Use it for flashing and validation.
-- **Streaming mode** (in progress): the probe reads a host-supplied list of memory blocks over
-  SWD without halting the core, and streams the samples to the host over an open TCP
-  protocol.
-
-## Repository layout
-
-The repository root is the ESP-IDF project (esp32s3). Its own components are registered in
-`CMakeLists.txt` instead of IDF's usual `main/` and `components/`.
-
-```
-App/                         probe application: Wi-Fi/mDNS, SWD owner task, GDB server
-Platform/                    BMD's ESP32-S3 platform port: SWD tap, GDB over TCP, monitor
-                             commands. Builds BMD from External/blackmagic
-External/blackmagic/         Black Magic Debug v2.1.0 (git submodule, pinned)
-proto/                       streaming protocol spec and header (MIT)
-host/python/                 reference client, planner, viewer (MIT)
-docs/                        plan, stage reports and measurement notes
-```
-
-## Code style
-
-The firmware is C++ (IDF's default, `gnu++26`). Layout and style follow the HYPR firmware
-repositories: one class per module in PascalCase files, formatted with the root
-`.clang-format`. BMD is C: each file includes the BMD headers it needs in one `extern "C"`
-block, and the functions BMD calls keep their C names. Only `Platform/platform.h`, which BMD's
-own sources include, and the `Platform/libc_compat` shim stay C.
-
-For clangd, `.clangd` points at `build/compile_commands.json`. clangd needs
-`--query-driver=**/xtensa-esp*-elf-*` to find the toolchain headers, which
-`.vscode/settings.json` sets.
+- **MCUViewer** over the NETWORK PROBE protocol (TCP port 2023). The probe connects to the
+  target without halting it and reads and writes memory while it runs. In HSS mode it samples
+  on its own, with its own timestamps, and streams the samples.
+- **GDB**: BMD's GDB server over Wi-Fi (TCP port 2022). Use it for flashing and validation.
 
 ## Hardware
 
 Reference board: Waveshare ESP32-S3-Pico. The defaults below can be changed in menuconfig
-under *MVProbe SWD / Black Magic Debug port*.
+under *NETWORK PROBE SWD / Black Magic Debug port*.
 
 | Signal | GPIO | Pico header |
 |---|---|---|
@@ -65,32 +38,72 @@ Wi-Fi credentials never go into tracked files. Create `sdkconfig.local` in the r
 root. It is git-ignored:
 
 ```
-CONFIG_MVPROBE_WIFI_SSID="my-network"
-CONFIG_MVPROBE_WIFI_PASSWORD="my-password"
+CONFIG_NETWORK_PROBE_WIFI_SSID="my-network"
+CONFIG_NETWORK_PROBE_WIFI_PASSWORD="my-password"
 ```
 
 It is applied as an extra defaults file. Defaults only fill options that are missing from
 `sdkconfig`, so after changing it, delete `sdkconfig` (or use `idf.py menuconfig`).
 
 If no SSID is set, or the station gets no IP address within 15 s, the probe starts an access
-point named `mvprobe` (192.168.4.1). The AP is open unless `CONFIG_MVPROBE_AP_PASSWORD` is
-set (at least 8 characters).
+point named `network-probe` (192.168.4.1). The AP is open unless
+`CONFIG_NETWORK_PROBE_AP_PASSWORD` is set (at least 8 characters).
 
-## Using GDB mode
+## Using MCUViewer
+
+In the acquisition settings pick the debug probe **NETWORK_PROBE** and enter:
+
+- **Address**: `network-probe.local`, or the IP address from the boot log;
+- **Port**: `2023` (the field is shared with the GDB server probe, whose default is 3333);
+- **SWD speed**: up to 8000 kHz is verified with a logic analyzer, faster clocks are not yet;
+- **Mode**: **HSS**. NORMAL works too, but every sampling tick costs a network round trip, which
+  limits it to about 100–300 Hz over Wi-Fi.
+
+The probe serves one client at a time. While MCUViewer is connected, GDB connections are
+refused; while GDB is connected, MCUViewer gets no answer until the GDB session ends. A second
+MCUViewer connection takes over from the first.
+
+## Using GDB
 
 ```
 gdb-multiarch firmware.elf
-(gdb) target extended-remote mvprobe.local:2022
+(gdb) target extended-remote network-probe.local:2022
 (gdb) monitor swd_scan
 (gdb) attach 1
 (gdb) x/8x 0x20000000
 (gdb) load
-(gdb) monitor swd_info      # SWD clock and transaction timing
 (gdb) monitor frequency 8M  # change the SWD clock
 ```
 
+## Repository layout
+
+The repository root is the ESP-IDF project (esp32s3). Its own components are registered in
+`CMakeLists.txt` instead of IDF's usual `main/` and `components/`.
+
+```
+App/                  probe application: Wi-Fi and mDNS, the net task (NetServer), the SWD
+                      owner task with the GDB server, requests and streaming (ProbeService),
+                      light connect (TargetLink) and the protocol header shared with MCUViewer
+Platform/             BMD's ESP32-S3 platform port (SWD tap, GDB over TCP); builds BMD from
+                      External/blackmagic
+External/blackmagic/  Black Magic Debug v2.1.0 (git submodule, pinned)
+```
+
+## Development
+
+The firmware is C++ (IDF's default, `gnu++26`): one class per module in PascalCase files,
+formatted with the root `.clang-format`. BMD is C: each file includes the BMD headers it needs
+in one `extern "C"` block, and the functions BMD calls keep their C names. Only
+`Platform/platform.h`, which BMD's own sources include, and the `Platform/libc_compat` shim
+stay C.
+
+For clangd, `.clangd` points at `build/compile_commands.json`. clangd needs
+`--query-driver=**/xtensa-esp*-elf-*` to find the toolchain headers, which
+`.vscode/settings.json` sets.
+
 ## Licensing
 
-- The firmware (everything outside `proto/` and `host/`): GPL-3.0-or-later (see `COPYING`),
-  because it links Black Magic Debug.
-- `proto/` and `host/`: MIT. These directories must not contain code derived from BMD.
+The firmware is GPL-3.0-or-later (see `COPYING`), because it links Black Magic Debug.
+
+`App/NetworkProbeProto.hpp`, the protocol header shared with MCUViewer, is MIT. It must not
+contain code derived from BMD.

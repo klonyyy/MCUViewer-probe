@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -25,7 +25,7 @@ void Wifi::start()
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 	staNetif = esp_netif_create_default_wifi_sta();
 	apNetif = esp_netif_create_default_wifi_ap();
-	ESP_ERROR_CHECK(esp_netif_set_hostname(staNetif, CONFIG_MVPROBE_HOSTNAME));
+	ESP_ERROR_CHECK(esp_netif_set_hostname(staNetif, CONFIG_NETWORK_PROBE_HOSTNAME));
 
 	const wifi_init_config_t initConfig = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&initConfig));
@@ -33,7 +33,7 @@ void Wifi::start()
 	ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, eventHandler, this));
 	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, eventHandler, this));
 
-	if (strlen(CONFIG_MVPROBE_WIFI_SSID) == 0 || !startStation())
+	if (strlen(CONFIG_NETWORK_PROBE_WIFI_SSID) == 0 || !startStation())
 		startAccessPoint();
 
 	startMdns();
@@ -75,20 +75,20 @@ void Wifi::handleEvent(esp_event_base_t base, int32_t id, void* data)
 bool Wifi::startStation()
 {
 	wifi_config_t config = {};
-	strlcpy(reinterpret_cast<char*>(config.sta.ssid), CONFIG_MVPROBE_WIFI_SSID, sizeof(config.sta.ssid));
-	strlcpy(reinterpret_cast<char*>(config.sta.password), CONFIG_MVPROBE_WIFI_PASSWORD, sizeof(config.sta.password));
+	strlcpy(reinterpret_cast<char*>(config.sta.ssid), CONFIG_NETWORK_PROBE_WIFI_SSID, sizeof(config.sta.ssid));
+	strlcpy(reinterpret_cast<char*>(config.sta.password), CONFIG_NETWORK_PROBE_WIFI_PASSWORD, sizeof(config.sta.password));
 
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &config));
 	ESP_ERROR_CHECK(esp_wifi_start());
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
-	ESP_LOGI(tag, "connecting to \"%s\"", CONFIG_MVPROBE_WIFI_SSID);
-	const EventBits_t bits = xEventGroupWaitBits(events, gotIpBit, pdFALSE, pdTRUE, pdMS_TO_TICKS(CONFIG_MVPROBE_WIFI_STA_TIMEOUT_MS));
+	ESP_LOGI(tag, "connecting to \"%s\"", CONFIG_NETWORK_PROBE_WIFI_SSID);
+	const EventBits_t bits = xEventGroupWaitBits(events, gotIpBit, pdFALSE, pdTRUE, pdMS_TO_TICKS(CONFIG_NETWORK_PROBE_WIFI_STA_TIMEOUT_MS));
 	if (bits & gotIpBit)
 		return true;
 
-	ESP_LOGW(tag, "no IP address after %d ms", CONFIG_MVPROBE_WIFI_STA_TIMEOUT_MS);
+	ESP_LOGW(tag, "no IP address after %d ms", CONFIG_NETWORK_PROBE_WIFI_STA_TIMEOUT_MS);
 	staReconnect = false;
 	ESP_ERROR_CHECK(esp_wifi_stop());
 	return false;
@@ -97,13 +97,13 @@ bool Wifi::startStation()
 void Wifi::startAccessPoint()
 {
 	wifi_config_t config = {};
-	strlcpy(reinterpret_cast<char*>(config.ap.ssid), CONFIG_MVPROBE_AP_SSID, sizeof(config.ap.ssid));
+	strlcpy(reinterpret_cast<char*>(config.ap.ssid), CONFIG_NETWORK_PROBE_AP_SSID, sizeof(config.ap.ssid));
 	config.ap.ssid_len = strlen(reinterpret_cast<const char*>(config.ap.ssid));
-	strlcpy(reinterpret_cast<char*>(config.ap.password), CONFIG_MVPROBE_AP_PASSWORD, sizeof(config.ap.password));
-	config.ap.channel = CONFIG_MVPROBE_AP_CHANNEL;
+	strlcpy(reinterpret_cast<char*>(config.ap.password), CONFIG_NETWORK_PROBE_AP_PASSWORD, sizeof(config.ap.password));
+	config.ap.channel = CONFIG_NETWORK_PROBE_AP_CHANNEL;
 	config.ap.authmode = WIFI_AUTH_WPA2_PSK;
 	config.ap.max_connection = apMaxConnections;
-	if (strlen(CONFIG_MVPROBE_AP_PASSWORD) < 8)
+	if (strlen(CONFIG_NETWORK_PROBE_AP_PASSWORD) < 8)
 	{
 		ESP_LOGW(tag, "AP password shorter than 8 characters, starting an OPEN access point");
 		config.ap.authmode = WIFI_AUTH_OPEN;
@@ -117,14 +117,15 @@ void Wifi::startAccessPoint()
 
 	esp_netif_ip_info_t ipInfo;
 	esp_netif_get_ip_info(apNetif, &ipInfo);
-	ESP_LOGI(tag, "access point \"%s\" up, IP " IPSTR, CONFIG_MVPROBE_AP_SSID, IP2STR(&ipInfo.ip));
+	ESP_LOGI(tag, "access point \"%s\" up, IP " IPSTR, CONFIG_NETWORK_PROBE_AP_SSID, IP2STR(&ipInfo.ip));
 }
 
 void Wifi::startMdns()
 {
 	ESP_ERROR_CHECK(mdns_init());
-	ESP_ERROR_CHECK(mdns_hostname_set(CONFIG_MVPROBE_HOSTNAME));
-	ESP_ERROR_CHECK(mdns_instance_name_set("MVProbe"));
-	ESP_ERROR_CHECK(mdns_service_add("MVProbe GDB server", "_gdb", "_tcp", CONFIG_MVPROBE_GDB_PORT, nullptr, 0));
-	ESP_LOGI(tag, "mDNS hostname %s.local", CONFIG_MVPROBE_HOSTNAME);
+	ESP_ERROR_CHECK(mdns_hostname_set(CONFIG_NETWORK_PROBE_HOSTNAME));
+	ESP_ERROR_CHECK(mdns_instance_name_set("NETWORK PROBE"));
+	ESP_ERROR_CHECK(mdns_service_add("NETWORK PROBE GDB server", "_gdb", "_tcp", CONFIG_NETWORK_PROBE_GDB_PORT, nullptr, 0));
+	ESP_ERROR_CHECK(mdns_service_add("NETWORK PROBE", "_network-probe", "_tcp", CONFIG_NETWORK_PROBE_PORT, nullptr, 0));
+	ESP_LOGI(tag, "mDNS hostname %s.local", CONFIG_NETWORK_PROBE_HOSTNAME);
 }

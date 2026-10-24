@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Black Magic Debug platform definitions for the ESP32-S3 port.
@@ -13,10 +13,7 @@
 
 #include "timing.h"
 
-#define PLATFORM_IDENT "(MVProbe ESP32-S3) "
-
-/* Extra monitor commands, see platform_cmds.c */
-#define PLATFORM_HAS_CUSTOM_COMMANDS
+#define PLATFORM_IDENT "(NETWORK PROBE ESP32-S3) "
 
 /* No status LEDs yet */
 #define SET_RUN_STATE(state) \

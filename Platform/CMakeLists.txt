@@ -108,7 +108,6 @@ set(port_srcs
     SwdTap.cpp
     JtagTapStub.cpp
     GdbTcpInterface.cpp
-    MonitorCommands.cpp
 )
 if(CONFIG_LIBC_PICOLIBC)
     list(APPEND port_srcs libc_compat.c)
@@ -143,7 +142,7 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC
     CONFIG_POINTER_SIZE=4
     NO_LIBOPENCM3=1
     ADVERTISE_NOACKMODE=1
-    $<$<BOOL:${CONFIG_MVPROBE_BMD_DEBUG}>:ENABLE_DEBUG=1>
+    $<$<BOOL:${CONFIG_NETWORK_PROBE_BMD_DEBUG}>:ENABLE_DEBUG=1>
 )
 # Prototypes for the newlib-only stdio names BMD's stdio_newlib.h maps to
 target_compile_options(${COMPONENT_LIB} PUBLIC

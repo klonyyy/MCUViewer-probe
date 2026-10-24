@@ -1,6 +1,6 @@
-menu "MVProbe SWD / Black Magic Debug port"
+menu "NETWORK PROBE SWD / Black Magic Debug port"
 
-    config MVPROBE_SWCLK_GPIO
+    config NETWORK_PROBE_SWCLK_GPIO
         int "SWCLK GPIO"
         range 0 31
         default 12
@@ -9,7 +9,7 @@ menu "MVProbe SWD / Black Magic Debug port"
             (physical pin 2) on the Waveshare ESP32-S3-Pico, and is also the FSPICLK
             IO_MUX pin, which keeps an SPI-based SWD implementation possible later.
 
-    config MVPROBE_SWDIO_GPIO
+    config NETWORK_PROBE_SWDIO_GPIO
         int "SWDIO GPIO"
         range 0 31
         default 11
@@ -19,7 +19,7 @@ menu "MVProbe SWD / Black Magic Debug port"
             (physical pin 1) on the Waveshare ESP32-S3-Pico, and is also the FSPID
             IO_MUX pin.
 
-    config MVPROBE_NRST_GPIO
+    config NETWORK_PROBE_NRST_GPIO
         int "Target nRST GPIO (-1 = not connected)"
         range -1 48
         default 14
@@ -28,21 +28,21 @@ menu "MVProbe SWD / Black Magic Debug port"
             (physical pin 5) on the Waveshare ESP32-S3-Pico. GPIO13 (GP2) is left free
             on purpose: it is the FSPIQ IO_MUX pin.
 
-    config MVPROBE_SWD_FREQ_HZ
+    config NETWORK_PROBE_SWD_FREQ_HZ
         int "Default SWD clock frequency (Hz)"
         range 10000 40000000
         default 4000000
         help
             Requested SWCLK frequency at boot. Can be changed at runtime with
-            "monitor frequency". The achievable maximum is limited by the bit-bang loop;
-            "monitor swd_info" reports the measured clock.
+            "monitor frequency". The achievable maximum is limited by the bit-bang loop
+            and logged at boot.
 
-    config MVPROBE_GDB_PORT
+    config NETWORK_PROBE_GDB_PORT
         int "GDB server TCP port"
         range 1 65535
         default 2022
 
-    config MVPROBE_BMD_DEBUG
+    config NETWORK_PROBE_BMD_DEBUG
         bool "Enable Black Magic Debug debug output on the console"
         default n
 

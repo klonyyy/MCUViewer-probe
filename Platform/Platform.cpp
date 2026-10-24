@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2026 MVProbe contributors
+ * SPDX-FileCopyrightText: 2026 Piotr Wasilewski
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Black Magic Debug platform functions for the ESP32-S3 port.
@@ -22,7 +22,7 @@ extern "C"
 
 namespace
 {
-constexpr gpio_num_t nrstGpio = static_cast<gpio_num_t>(CONFIG_MVPROBE_NRST_GPIO); /**< GPIO_NUM_NC (-1) when not connected. */
+constexpr gpio_num_t nrstGpio = static_cast<gpio_num_t>(CONFIG_NETWORK_PROBE_NRST_GPIO); /**< GPIO_NUM_NC (-1) when not connected. */
 
 /* nRST has no sense line, so report the state we last drove */
 bool nrstAsserted = false;
@@ -34,9 +34,9 @@ uint32_t target_clk_divider = 0;
 void platform_init(void)
 {
 	SwdTap::init();
-	SwdTap::setFrequency(CONFIG_MVPROBE_SWD_FREQ_HZ);
+	SwdTap::setFrequency(CONFIG_NETWORK_PROBE_SWD_FREQ_HZ);
 
-#if CONFIG_MVPROBE_NRST_GPIO >= 0
+#if CONFIG_NETWORK_PROBE_NRST_GPIO >= 0
 	const gpio_config_t nrstConfig = {
 		.pin_bit_mask = 1ULL << nrstGpio,
 		.mode = GPIO_MODE_INPUT_OUTPUT_OD,
@@ -63,7 +63,7 @@ void platform_delay(const uint32_t ms)
 
 void platform_nrst_set_val(const bool assert)
 {
-#if CONFIG_MVPROBE_NRST_GPIO >= 0
+#if CONFIG_NETWORK_PROBE_NRST_GPIO >= 0
 	gpio_set_level(nrstGpio, assert ? 0 : 1);
 #endif
 	nrstAsserted = assert;
