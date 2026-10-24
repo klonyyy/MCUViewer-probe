@@ -1,0 +1,13 @@
+{
+    "clangd.arguments": [
+        "--query-driver=**/xtensa-esp*-elf-*",
+        "--background-index"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "[c]": {
+        "editor.inlayHints.enabled": "off"
+    },
+    "[cpp]": {
+        "editor.inlayHints.enabled": "off"
+    }
+}

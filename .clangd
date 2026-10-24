@@ -1,0 +1,10 @@
+CompileFlags:
+  CompilationDatabase: build
+  # Xtensa GCC options from the ESP-IDF toolchain that clang doesn't know
+  Remove:
+    - -mlongcalls
+    - -mdisable-hardware-atomics
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -fzero-init-padding-bits=*
+    - -fno-malloc-dce
