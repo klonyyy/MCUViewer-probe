@@ -1,6 +1,6 @@
 # MVProbe — plan and status
 
-Last updated: 2026-10-23
+Last updated: 2026-10-24
 
 ## Goal
 
@@ -20,9 +20,14 @@ A wireless SWD probe on the ESP32-S3 for MCUViewer, built on Black Magic Debug (
   the source and cite the paths and functions you rely on.
 - **English everywhere.** Code, comments, commits and docs are in English.
 - **Commits.** Small, logical commits. Secrets (Wi-Fi credentials) live only in the
-  git-ignored `firmware/sdkconfig.local` or in menuconfig.
+  git-ignored `sdkconfig.local` or in menuconfig.
+- **Code style.** Layout and style follow the HYPR firmware repositories
+  (`hypr-software-hbridge`): IDF project at the root, components in `App/` and `Platform/`,
+  submodules in `External/`, C++ formatted with the root `.clang-format`. BMD headers go in
+  one `extern "C"` block per file. Code stays C only where BMD's C sources include it.
 - **Licensing.**
-  - `firmware/` is GPL-3.0-or-later, because it links BMD.
+  - The firmware (everything outside `proto/` and `host/`) is GPL-3.0-or-later, because it
+    links BMD.
   - `proto/` (`PROTOCOL.md`, `mv_proto.h`) and `host/` are MIT. They are written from scratch
     and contain no code derived from BMD, because they are reused in the closed-source
     MCUViewer.
@@ -168,3 +173,4 @@ tree):
 | 2026-10-23 | All Cortex-M target families enabled |
 | 2026-10-23 | One SWD owner task on core 1. The GDB transport uses lwIP sockets directly from it |
 | 2026-10-23 | `host/` and `proto/` MIT, PySide6 for the viewer |
+| 2026-10-24 | Repository layout and code style of the HYPR firmware repositories: `firmware/main/` → `App/`, `firmware/components/bmd/` → `Platform/`, the BMD submodule → `External/blackmagic`. Firmware code in C++, except `platform.h` and the libc shim |

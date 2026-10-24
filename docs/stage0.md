@@ -1,5 +1,8 @@
 # Stage 0 — Reconnaissance report
 
+> Paths are those of the time. Since 2026-10-24 the firmware lives in `App/`, `Platform/` and
+> `External/blackmagic`, in C++ (see the decision log in [plan.md](plan.md)).
+
 Scope: decide how to build a wireless SWD probe on ESP32-S3 out of Black Magic Debug (BMD),
 with a non-halting memory streaming mode for MCUViewer and a switchable GDB mode.
 No firmware was written in this stage.

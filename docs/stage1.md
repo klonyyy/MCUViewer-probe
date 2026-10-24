@@ -1,5 +1,8 @@
 # Stage 1 — BMD GDB server over Wi-Fi
 
+> Paths are those of the time. Since 2026-10-24 the firmware lives in `App/`, `Platform/` and
+> `External/blackmagic`, in C++ (see the decision log in [plan.md](plan.md)).
+
 Status: builds cleanly with ESP-IDF v6.1 (0 warnings with IDF's `-Werror`). The GDB flow works
 on hardware (Waveshare ESP32-S3-Pico, 2026-10-23), and SWCLK was confirmed
 at 8 MHz with a logic analyzer.
