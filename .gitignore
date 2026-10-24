@@ -1,9 +1,12 @@
 # ESP-IDF build output and local configuration
-firmware/build/
-firmware/sdkconfig
-firmware/sdkconfig.old
-firmware/sdkconfig.local
-firmware/managed_components/
+build*/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.local
+/managed_components/
+
+# clangd
+.cache/
 
 # Python
 __pycache__/

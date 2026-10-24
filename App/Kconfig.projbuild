@@ -5,7 +5,7 @@ menu "MVProbe network"
         default ""
         help
             Network to join. Leave empty to always start the fallback access point.
-            Put real credentials in firmware/sdkconfig.local (git-ignored), not in
+            Put real credentials in sdkconfig.local (git-ignored), not in
             sdkconfig.defaults.
 
     config MVPROBE_WIFI_PASSWORD

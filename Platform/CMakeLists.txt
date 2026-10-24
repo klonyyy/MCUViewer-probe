@@ -1,9 +1,10 @@
-# Black Magic Debug (git submodule, pinned) + the ESP32-S3 platform port.
+# Black Magic Debug (External/blackmagic, git submodule, pinned) + the ESP32-S3 platform port.
 #
 # The source lists mirror src/meson.build and src/target/meson.build of BMD v2.1.0.
 # Target families: all Cortex-M families from the meson `targets` option.
 
-set(bmd_src "${CMAKE_CURRENT_LIST_DIR}/blackmagic/src")
+get_filename_component(bmd_dir "${CMAKE_CURRENT_LIST_DIR}/../External/blackmagic" ABSOLUTE)
+set(bmd_src "${bmd_dir}/src")
 
 set(bmd_core_srcs
     command.c
@@ -103,20 +104,20 @@ set(bmd_target_srcs
 list(TRANSFORM bmd_target_srcs PREPEND "${bmd_src}/target/")
 
 set(port_srcs
-    port/platform.c
-    port/swdptap_esp.c
-    port/jtagtap_stub.c
-    port/gdb_if_tcp.c
-    port/platform_cmds.c
+    platform.c
+    swdptap_esp.c
+    jtagtap_stub.c
+    gdb_if_tcp.c
+    platform_cmds.c
 )
 if(CONFIG_LIBC_PICOLIBC)
-    list(APPEND port_srcs port/libc_compat.c)
+    list(APPEND port_srcs libc_compat.c)
 endif()
 
 # version.h: same as meson's vcs_tag() on src/include/version.h.in
 execute_process(
     COMMAND git describe --always --dirty --tags
-    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/blackmagic"
+    WORKING_DIRECTORY "${bmd_dir}"
     OUTPUT_VARIABLE VCS_TAG
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
@@ -129,7 +130,7 @@ configure_file("${bmd_src}/include/version.h.in" "${CMAKE_CURRENT_BINARY_DIR}/ge
 
 idf_component_register(
     SRCS ${bmd_core_srcs} ${bmd_target_srcs} ${port_srcs}
-    INCLUDE_DIRS port "${bmd_src}/include" "${bmd_src}" "${bmd_src}/target"
+    INCLUDE_DIRS . "${bmd_src}/include" "${bmd_src}" "${bmd_src}/target"
     PRIV_INCLUDE_DIRS "${CMAKE_CURRENT_BINARY_DIR}/generated"
     PRIV_REQUIRES esp_driver_gpio esp_hal_gpio esp_timer lwip log
     # target_probe.c provides weak no-op fallbacks for every vendor probe. Linking the
@@ -146,7 +147,7 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC
 )
 # Prototypes for the newlib-only stdio names BMD's stdio_newlib.h maps to
 target_compile_options(${COMPONENT_LIB} PUBLIC
-    "SHELL:-include \"${CMAKE_CURRENT_LIST_DIR}/port/libc_compat.h\""
+    "SHELL:-include \"${CMAKE_CURRENT_LIST_DIR}/libc_compat.h\""
 )
 
 # Target family selection (src/target/meson.build), only relevant to BMD's own sources
