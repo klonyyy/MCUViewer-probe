@@ -5,11 +5,11 @@
  * newlib integer-only stdio entry points for PicolibC builds, see libc_compat.h.
  */
 
-#include <stdio.h>
-
 #include "libc_compat.h"
 
-int siprintf(char *const str, const char *const format, ...)
+#include <stdio.h>
+
+int siprintf(char* const str, const char* const format, ...)
 {
 	va_list args;
 	va_start(args, format);
@@ -18,7 +18,7 @@ int siprintf(char *const str, const char *const format, ...)
 	return result;
 }
 
-int sniprintf(char *const str, const size_t size, const char *const format, ...)
+int sniprintf(char* const str, const size_t size, const char* const format, ...)
 {
 	va_list args;
 	va_start(args, format);
@@ -27,17 +27,17 @@ int sniprintf(char *const str, const size_t size, const char *const format, ...)
 	return result;
 }
 
-int vsniprintf(char *const str, const size_t size, const char *const format, va_list args)
+int vsniprintf(char* const str, const size_t size, const char* const format, va_list args)
 {
 	return vsnprintf(str, size, format, args);
 }
 
-int vasiprintf(char **const str, const char *const format, va_list args)
+int vasiprintf(char** const str, const char* const format, va_list args)
 {
 	return vasprintf(str, format, args);
 }
 
-int siscanf(const char *const str, const char *const format, ...)
+int siscanf(const char* const str, const char* const format, ...)
 {
 	va_list args;
 	va_start(args, format);

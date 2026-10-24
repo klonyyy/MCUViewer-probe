@@ -16,10 +16,20 @@
 #include <stdarg.h>
 #include <stddef.h>
 
-int siprintf(char *str, const char *format, ...);
-int sniprintf(char *str, size_t size, const char *format, ...);
-int vsniprintf(char *str, size_t size, const char *format, va_list args);
-int vasiprintf(char **str, const char *format, va_list args);
-int siscanf(const char *str, const char *format, ...);
+/* The C++ sources include BMD headers too, which maps their stdio calls to these */
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+	int siprintf(char* str, const char* format, ...);
+	int sniprintf(char* str, size_t size, const char* format, ...);
+	int vsniprintf(char* str, size_t size, const char* format, va_list args);
+	int vasiprintf(char** str, const char* format, va_list args);
+	int siscanf(const char* str, const char* format, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* LIBC_COMPAT_H */

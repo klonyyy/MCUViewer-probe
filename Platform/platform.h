@@ -20,15 +20,18 @@
 
 /* No status LEDs yet */
 #define SET_RUN_STATE(state) \
-	do {                     \
+	do                       \
+	{                        \
 		(void)(state);       \
 	} while (0)
 #define SET_IDLE_STATE(state) \
-	do {                      \
+	do                        \
+	{                         \
 		(void)(state);        \
 	} while (0)
 #define SET_ERROR_STATE(state) \
-	do {                       \
+	do                         \
+	{                          \
 		(void)(state);         \
 	} while (0)
 

@@ -104,11 +104,11 @@ set(bmd_target_srcs
 list(TRANSFORM bmd_target_srcs PREPEND "${bmd_src}/target/")
 
 set(port_srcs
-    platform.c
-    swdptap_esp.c
-    jtagtap_stub.c
-    gdb_if_tcp.c
-    platform_cmds.c
+    Platform.cpp
+    SwdTap.cpp
+    JtagTapStub.cpp
+    GdbTcpInterface.cpp
+    MonitorCommands.cpp
 )
 if(CONFIG_LIBC_PICOLIBC)
     list(APPEND port_srcs libc_compat.c)
