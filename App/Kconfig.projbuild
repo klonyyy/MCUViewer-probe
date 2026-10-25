@@ -1,41 +1,46 @@
 menu "NETWORK PROBE network"
 
     config NETWORK_PROBE_WIFI_SSID
-        string "Wi-Fi SSID (station mode)"
+        string "Default Wi-Fi SSID"
         default ""
         help
-            Network to join. Leave empty to always start the fallback access point.
-            Put real credentials in sdkconfig.local (git-ignored), not in
+            Network to join until one is saved on the setup page. Leave empty to start
+            in setup mode. Put real credentials in sdkconfig.local (git-ignored), not in
             sdkconfig.defaults.
 
     config NETWORK_PROBE_WIFI_PASSWORD
-        string "Wi-Fi password (station mode)"
+        string "Default Wi-Fi password"
         default ""
 
     config NETWORK_PROBE_WIFI_STA_TIMEOUT_MS
-        int "Station connect timeout before AP fallback (ms)"
+        int "Station connect timeout at boot before setup mode (ms)"
         range 1000 120000
         default 15000
 
-    config NETWORK_PROBE_AP_SSID
-        string "Fallback access point SSID"
-        default "network-probe"
-
     config NETWORK_PROBE_AP_PASSWORD
-        string "Fallback access point password"
+        string "Setup access point password"
         default ""
         help
             WPA2 password, at least 8 characters. Anything shorter starts an OPEN
-            access point.
+            access point. The access point is named after the device id,
+            network-probe-xxxxxx.
 
     config NETWORK_PROBE_AP_CHANNEL
-        int "Fallback access point channel"
+        int "Setup access point channel"
         range 1 13
         default 6
+        help
+            Once the station joins a network, the access point moves to the channel
+            of that network.
 
-    config NETWORK_PROBE_HOSTNAME
-        string "Hostname (DHCP and mDNS)"
-        default "network-probe"
+    config NETWORK_PROBE_SETUP_BUTTON_GPIO
+        int "Setup button GPIO (-1 = none)"
+        range -1 48
+        default 0
+        help
+            Active low, with the internal pull-up. Holding it for 3 s while the probe
+            runs forgets the saved network and restarts the probe. The default GPIO0
+            is the BOOT button of the Waveshare ESP32-S3-Pico.
 
     config NETWORK_PROBE_PORT
         int "NETWORK PROBE protocol TCP port (MCUViewer)"

@@ -12,5 +12,18 @@
     },
     "idf.flashType": "UART",
     "idf.currentSetup": "C:\\Espressif\\v6.1\\esp-idf",
-    "idf.port": "COM11"
+    "idf.port": "COM11",
+    "idf.openOcdConfigs": [
+        "interface/ftdi/esp_ftdi.cfg",
+        "target/esp32s3.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TOOLS_PATH": "C:\\Espressif\\tools",
+        "OPENOCD_SCRIPTS": "C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20260703\\openocd-esp32\\share\\openocd\\scripts",
+        "ESP_ROM_ELF_DIR": "C:\\Espressif\\tools\\esp-rom-elfs\\20241011\\",
+        "ESP_CLANG_LIBS_PATH": "C:\\Espressif\\tools\\esp-clang-libs\\esp-21.1.3_20260408\\esp-clang\\lib",
+        "IDF_COMPONENT_LOCAL_STORAGE_URL": "file://C:\\Espressif\\tools",
+        "IDF_CCACHE_ENABLE": "1",
+        "IDF_TARGET": "esp32s3"
+    }
 }

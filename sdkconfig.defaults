@@ -23,3 +23,5 @@ CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
 
 # Streaming: throughput is about the send buffer divided by the RTT, and Wi-Fi RTTs spike
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+# Setup mode adds the DNS and HTTP servers (6 sockets) to the NETWORK PROBE and GDB servers
+CONFIG_LWIP_MAX_SOCKETS=16

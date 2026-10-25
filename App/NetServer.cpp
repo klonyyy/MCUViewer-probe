@@ -13,10 +13,10 @@
 
 #include <algorithm>
 
+#include "NetworkSettings.hpp"
 #include "SwdTap.hpp"
 #include "esp_app_desc.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "esp_vfs_eventfd.h"
@@ -60,13 +60,12 @@ bool isRequest(const NetworkProbe::Type type)
 void NetServer::start(HostLink& hostLink, const int gdbListen)
 {
 	static_assert(NetworkProbe::helloResponseFixedSize + 3U * (1U + UINT8_MAX) <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a HELLO answer must fit");
+	static_assert(NetworkProbe::discoverResponseFixedSize + 3U * (1U + UINT8_MAX) <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a DISCOVER answer must fit");
 
 	link = &hostLink;
 	gdbListenSocket = gdbListen;
 
-	uint8_t mac[6] = {};
-	esp_read_mac(mac, ESP_MAC_WIFI_STA);
-	snprintf(probeId, sizeof(probeId), "network-probe-%02x%02x%02x", mac[3], mac[4], mac[5]);
+	NetworkSettings::getDeviceId(probeId, sizeof(probeId));
 
 	const esp_vfs_eventfd_config_t eventfdConfig = ESP_VFS_EVENTD_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_vfs_eventfd_register(&eventfdConfig));
@@ -96,6 +95,7 @@ void NetServer::start(HostLink& hostLink, const int gdbListen)
 	}
 
 	ESP_LOGI(tag, "NETWORK PROBE protocol listening on TCP port %d, id %s", CONFIG_NETWORK_PROBE_PORT, probeId);
+	openDiscoverySocket();
 	xTaskCreatePinnedToCore(taskEntry, "net", taskStackSize, this, taskPriority, nullptr, taskCore);
 }
 
@@ -129,6 +129,11 @@ void NetServer::run()
 			FD_SET(gdbListenSocket, &readSet);
 			maxSocket = std::max(maxSocket, gdbListenSocket);
 		}
+		if (discoverySocket >= 0)
+		{
+			FD_SET(discoverySocket, &readSet);
+			maxSocket = std::max(maxSocket, discoverySocket);
+		}
 		if (clientSocket >= 0)
 		{
 			FD_SET(clientSocket, &readSet);
@@ -157,6 +162,8 @@ void NetServer::run()
 		}
 		if (FD_ISSET(listenSocket, &readSet))
 			acceptClient();
+		if (discoverySocket >= 0 && FD_ISSET(discoverySocket, &readSet))
+			answerDiscovery();
 		if (watchGdb && FD_ISSET(gdbListenSocket, &readSet))
 		{
 			if (clientSocket >= 0)
@@ -233,6 +240,80 @@ void NetServer::refuseGdbClient()
 		close(sock);
 		ESP_LOGW(tag, "refused a GDB client: an MCUViewer session is active");
 	}
+}
+
+void NetServer::openDiscoverySocket()
+{
+	discoverySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (discoverySocket >= 0)
+	{
+		/* Needed to receive broadcasts when lwIP filters them per socket */
+		const int one = 1;
+		setsockopt(discoverySocket, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+
+		sockaddr_in address = {};
+		address.sin_family = AF_INET;
+		address.sin_port = htons(NetworkProbe::discoveryPort);
+		address.sin_addr.s_addr = htonl(INADDR_ANY);
+		if (bind(discoverySocket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0)
+		{
+			fcntl(discoverySocket, F_SETFL, fcntl(discoverySocket, F_GETFL, 0) | O_NONBLOCK);
+			ESP_LOGI(tag, "answering discovery on UDP port %u", NetworkProbe::discoveryPort);
+			return;
+		}
+		close(discoverySocket);
+		discoverySocket = -1;
+	}
+	ESP_LOGE(tag, "cannot open UDP port %u for discovery: errno %d", NetworkProbe::discoveryPort, errno);
+}
+
+void NetServer::answerDiscovery()
+{
+	/* One byte more than a DISCOVER frame, so a longer datagram shows by its size */
+	uint8_t request[NetworkProbe::frameOverhead + NetworkProbe::discoverRequestSize + 1];
+	sockaddr_in peer;
+	socklen_t peerLength = sizeof(peer);
+	const ssize_t received = recvfrom(discoverySocket, request, sizeof(request), 0, reinterpret_cast<sockaddr*>(&peer), &peerLength);
+	if (received != static_cast<ssize_t>(NetworkProbe::frameOverhead + NetworkProbe::discoverRequestSize))
+		return;
+
+	NetworkProbe::FrameHeader header;
+	if (!NetworkProbe::decodeHeader(request, header) || header.type != NetworkProbe::Type::DISCOVER || header.length != NetworkProbe::discoverRequestSize)
+		return;
+	if (NetworkProbe::getU32(request + NetworkProbe::headerSize + header.length) != esp_rom_crc32_le(0, request, NetworkProbe::headerSize + header.length))
+		return;
+
+	uint8_t* const frame = discoveryFrame.data();
+	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(NetworkProbe::Type::DISCOVER);
+	frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(NetworkProbe::Status::OK);
+	const uint16_t dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize);
+	const size_t length = sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + dataLength, header.seq);
+	/* Non-blocking: with the send buffer full the answer is dropped, and the host asks again */
+	sendto(discoverySocket, frame, length, 0, reinterpret_cast<const sockaddr*>(&peer), peerLength);
+
+	char peerName[16];
+	inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
+	ESP_LOGD(tag, "answered DISCOVER from %s", peerName);
+}
+
+uint16_t NetServer::buildDiscover(uint8_t* const data) const
+{
+	NetworkProbe::Session session = NetworkProbe::Session::FREE;
+	if (link->gdbRequested.load(std::memory_order_acquire) || link->gdbActive.load(std::memory_order_acquire))
+		session = NetworkProbe::Session::GDB;
+	else if (clientSocket >= 0)
+		session = NetworkProbe::Session::HOST;
+
+	NetworkProbe::putU16(data, NetworkProbe::protocolVersion);
+	NetworkProbe::putU16(data + 2, CONFIG_NETWORK_PROBE_PORT);
+	data[4] = NetworkProbe::toByte(session);
+	data[5] = 0;
+
+	uint8_t* out = data + NetworkProbe::discoverResponseFixedSize;
+	out = putString(out, probeName);
+	out = putString(out, esp_app_get_description()->version);
+	out = putString(out, probeId);
+	return static_cast<uint16_t>(out - data);
 }
 
 bool NetServer::receive()

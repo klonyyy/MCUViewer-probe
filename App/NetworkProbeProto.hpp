@@ -17,6 +17,7 @@ namespace NetworkProbe
 {
 constexpr uint16_t protocolVersion = 1;
 constexpr uint16_t tcpPort = 2023;
+constexpr uint16_t discoveryPort = 2023; /* UDP; the DISCOVER answer names the TCP port */
 
 /* Framing: header {u16 magic, u8 version, u8 type, u16 length, u16 seq}, payload, u32 CRC-32 */
 constexpr uint16_t frameMagic = 0x564D; /* the bytes 'M', 'V' */
@@ -36,6 +37,7 @@ enum class Type : uint8_t
 	READ_LIST = 0x06,
 	RESET = 0x07,
 	GET_STATUS = 0x08,
+	DISCOVER = 0x09, /* over UDP only */
 	SET_PLAN = 0x10,
 	START = 0x11,
 	STOP = 0x12,
@@ -87,22 +89,32 @@ enum class Event : uint8_t
 	SAMPLE_ERRORS = 3,   /* value: samples lost to target errors since START */
 };
 
+/* DISCOVER session state */
+enum class Session : uint8_t
+{
+	FREE = 0,
+	HOST = 1, /* a host is connected */
+	GDB = 2,  /* another client uses the debug link */
+};
+
 /* Payload sizes */
-constexpr size_t respHeaderSize = 2;           /* u8 request, u8 status */
-constexpr size_t helloRequestSize = 2;         /* u16 protocol */
-constexpr size_t helloResponseFixedSize = 24;  /* up to and including clock_max; name, firmware and id follow */
-constexpr size_t connectRequestSize = 6;       /* u32 clock, u8 ap_sel, u8 flags */
-constexpr size_t connectResponseSize = 16;     /* u32 dpidr, u32 targetid, u32 ap_idr, u32 clock */
-constexpr size_t readRequestSize = 6;          /* u32 address, u16 length */
-constexpr size_t writeRequestHeaderSize = 6;   /* u32 address, u16 length, then the data */
-constexpr size_t readListEntrySize = 5;        /* u32 address, u8 size; the request starts with u8 count */
-constexpr size_t statusResponseSize = 16;      /* u8 link, u8 reserved[3], u32 clock, u32 target_errors, u32 uptime_ms */
-constexpr size_t planHeaderSize = 7;           /* u16 plan_id, u32 period_us, u8 nblocks */
-constexpr size_t planBlockSize = 7;            /* u32 address, u16 count, u8 access_size */
-constexpr size_t dataHeaderSize = 10;          /* u16 plan_id, u32 first_sample, u16 nsamples, u16 bytes_per_sample */
-constexpr size_t eventSize = 5;                /* u8 event, u32 value */
-constexpr size_t sampleTimeSize = 4;           /* u32 t at the start of every sample record */
-constexpr uint32_t blockBoundary = 0x400;      /* a plan block must not cross a multiple of 1 KiB */
+constexpr size_t respHeaderSize = 2;            /* u8 request, u8 status */
+constexpr size_t helloRequestSize = 2;          /* u16 protocol */
+constexpr size_t helloResponseFixedSize = 24;   /* up to and including clock_max; name, firmware and id follow */
+constexpr size_t connectRequestSize = 6;        /* u32 clock, u8 ap_sel, u8 flags */
+constexpr size_t connectResponseSize = 16;      /* u32 dpidr, u32 targetid, u32 ap_idr, u32 clock */
+constexpr size_t readRequestSize = 6;           /* u32 address, u16 length */
+constexpr size_t writeRequestHeaderSize = 6;    /* u32 address, u16 length, then the data */
+constexpr size_t readListEntrySize = 5;         /* u32 address, u8 size; the request starts with u8 count */
+constexpr size_t statusResponseSize = 16;       /* u8 link, u8 reserved[3], u32 clock, u32 target_errors, u32 uptime_ms */
+constexpr size_t discoverRequestSize = 2;       /* u16 protocol */
+constexpr size_t discoverResponseFixedSize = 6; /* u16 protocol, u16 tcp_port, u8 session, u8 reserved; name, firmware and id follow */
+constexpr size_t planHeaderSize = 7;            /* u16 plan_id, u32 period_us, u8 nblocks */
+constexpr size_t planBlockSize = 7;             /* u32 address, u16 count, u8 access_size */
+constexpr size_t dataHeaderSize = 10;           /* u16 plan_id, u32 first_sample, u16 nsamples, u16 bytes_per_sample */
+constexpr size_t eventSize = 5;                 /* u8 event, u32 value */
+constexpr size_t sampleTimeSize = 4;            /* u32 t at the start of every sample record */
+constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a multiple of 1 KiB */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */
 struct FrameHeader

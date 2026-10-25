@@ -24,6 +24,8 @@
  *
  * It also watches the GDB port: a GDB client is handed to the SWD owner task when no NETWORK PROBE client is connected, and
  * refused otherwise. During a GDB session every request but HELLO is answered BUSY.
+ *
+ * Discovery: it answers DISCOVER datagrams on the UDP discovery port itself, in every session state.
  */
 class NetServer
 {
@@ -53,6 +55,18 @@ class NetServer
 	void acceptClient();
 	void closeClient();
 	void refuseGdbClient();
+
+	/**
+	 * @brief Opens the UDP discovery port. Without it the probe works, but hosts have to know its address.
+	 */
+	void openDiscoverySocket();
+
+	/**
+	 * @brief Reads one datagram from the discovery port and answers it if it is a well-formed DISCOVER.
+	 */
+	void answerDiscovery();
+
+	uint16_t buildDiscover(uint8_t* data) const;
 
 	/**
 	 * @brief Receives what the client sent and handles every complete frame.
@@ -105,7 +119,10 @@ class NetServer
 	int listenSocket = -1;
 	int clientSocket = -1;
 	int gdbListenSocket = -1;
+	int discoverySocket = -1;
 	char probeId[32] = {};
+
+	std::array<uint8_t, localFrameSize> discoveryFrame; /**< A DISCOVER answer; localFrame may hold a TCP answer meanwhile. */
 
 	std::array<uint8_t, bufferSize> rxBuffer;
 	size_t rxLength = 0;

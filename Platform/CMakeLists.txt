@@ -3,6 +3,11 @@
 # The source lists mirror src/meson.build and src/target/meson.build of BMD v2.1.0.
 # Target families: all Cortex-M families from the meson `targets` option.
 
+# The SWD tap uses the ESP32-S3's dedicated GPIO; other chips fail deep in the build otherwise
+if(NOT IDF_TARGET STREQUAL "esp32s3")
+    message(FATAL_ERROR "NETWORK PROBE runs on the ESP32-S3, the build is set up for ${IDF_TARGET}: run `idf.py set-target esp32s3`")
+endif()
+
 get_filename_component(bmd_dir "${CMAKE_CURRENT_LIST_DIR}/../External/blackmagic" ABSOLUTE)
 set(bmd_src "${bmd_dir}/src")
 

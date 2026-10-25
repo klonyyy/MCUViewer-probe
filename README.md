@@ -34,8 +34,8 @@ idf.py build
 idf.py -p <PORT> flash monitor
 ```
 
-Wi-Fi credentials never go into tracked files. Create `sdkconfig.local` in the repository
-root. It is git-ignored:
+For development, a default network can be built in. Wi-Fi credentials never go into tracked
+files: create `sdkconfig.local` in the repository root. It is git-ignored:
 
 ```
 CONFIG_NETWORK_PROBE_WIFI_SSID="my-network"
@@ -43,17 +43,43 @@ CONFIG_NETWORK_PROBE_WIFI_PASSWORD="my-password"
 ```
 
 It is applied as an extra defaults file. Defaults only fill options that are missing from
-`sdkconfig`, so after changing it, delete `sdkconfig` (or use `idf.py menuconfig`).
+`sdkconfig`, so after changing it, or `sdkconfig.defaults`, delete `sdkconfig` (or use
+`idf.py menuconfig`). The default network applies until a network is saved on the setup page.
 
-If no SSID is set, or the station gets no IP address within 15 s, the probe starts an access
-point named `network-probe` (192.168.4.1). The AP is open unless
-`CONFIG_NETWORK_PROBE_AP_PASSWORD` is set (at least 8 characters).
+## Connecting the probe to Wi-Fi
+
+The probe joins the network saved on it. Out of the box no network is saved, so it starts in
+**setup mode**:
+
+1. It opens an access point named after its device id, `network-probe-xxxxxx`: the last
+   three bytes of its MAC address. The boot log prints the id too.
+2. Join that network with a phone or a laptop. The setup page opens by itself (captive
+   portal); if it does not, open `http://192.168.4.1/`.
+3. Pick your network, enter its password and, if you like, a hostname instead of the device
+   id. Only 2.4 GHz networks work.
+4. The probe tries the network while its access point stays up, so the page shows the result:
+   the address, or why it failed (for example a wrong password). Once connected, the probe
+   saves the network and closes the access point a minute later.
+
+At every boot the probe joins the saved network. If it gets no IP address within 15 s, setup
+mode starts again, and the probe keeps trying the saved network every 30 s, so after a router
+outage it comes back by itself. While the access point is up, MCUViewer and GDB also work
+over it, at 192.168.4.1.
+
+To forget the saved network, hold the BOOT button (GPIO0, see
+`CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO`) for 3 s while the probe runs. It restarts in setup
+mode, or joins the default network if one is built in. Do not hold BOOT while powering up: that
+starts the ESP32-S3's download mode.
+
+The setup access point is open unless `CONFIG_NETWORK_PROBE_AP_PASSWORD` is set (at least 8
+characters).
 
 ## Using MCUViewer
 
 In the acquisition settings pick the debug probe **NETWORK_PROBE** and enter:
 
-- **Address**: `network-probe.local`, or the IP address from the boot log;
+- **Address**: the hostname with `.local`, by default `network-probe-xxxxxx.local`, or the IP
+  address shown on the setup page or in the boot log;
 - **Port**: `2023` (the field is shared with the GDB server probe, whose default is 3333);
 - **SWD speed**: up to 8000 kHz is verified with a logic analyzer, faster clocks are not yet;
 - **Mode**: **HSS**. NORMAL works too, but every sampling tick costs a network round trip, which
@@ -67,7 +93,7 @@ MCUViewer connection takes over from the first.
 
 ```
 gdb-multiarch firmware.elf
-(gdb) target extended-remote network-probe.local:2022
+(gdb) target extended-remote network-probe-xxxxxx.local:2022
 (gdb) monitor swd_scan
 (gdb) attach 1
 (gdb) x/8x 0x20000000
@@ -81,9 +107,11 @@ The repository root is the ESP-IDF project (esp32s3). Its own components are reg
 `CMakeLists.txt` instead of IDF's usual `main/` and `components/`.
 
 ```
-App/                  probe application: Wi-Fi and mDNS, the net task (NetServer), the SWD
-                      owner task with the GDB server, requests and streaming (ProbeService),
-                      light connect (TargetLink) and the protocol header shared with MCUViewer
+App/                  probe application: Wi-Fi and mDNS, setup mode with the setup page
+                      (SetupPortal) and the saved network (NetworkSettings), the net task
+                      (NetServer), the SWD owner task with the GDB server, requests and
+                      streaming (ProbeService), light connect (TargetLink) and the protocol
+                      header shared with MCUViewer
 Platform/             BMD's ESP32-S3 platform port (SWD tap, GDB over TCP); builds BMD from
                       External/blackmagic
 External/blackmagic/  Black Magic Debug v2.1.0 (git submodule, pinned)
