@@ -12,6 +12,7 @@
 #include "HostLink.hpp"
 #include "NetServer.hpp"
 #include "ProbeService.hpp"
+#include "SwoCapture.hpp"
 #include "Wifi.hpp"
 
 /**
@@ -44,6 +45,7 @@ class App
 	GdbServer gdbServer;
 	HostLink hostLink;
 	ProbeService probeService;
+	SwoCapture swoCapture;
 	NetServer netServer;
 };
 

@@ -13,6 +13,7 @@
 
 #include "HostLink.hpp"
 #include "NetworkProbeProto.hpp"
+#include "SwoCapture.hpp"
 
 /**
  * @brief The net task, on core 0: the network side of the NETWORK PROBE protocol.
@@ -21,6 +22,9 @@
  * itself, hands every other request to the SWD owner task through HostLink, and sends the answers. It drains the
  * sample ring into DATA frames and reports EVENTs. Answers go out before samples, and the socket never blocks the
  * task, so a full TCP window only fills the ring.
+ *
+ * SWO needs no SWD, so the net task owns the SWO capture: it answers SWO_START and SWO_STOP itself, and sends the
+ * captured bytes in SWO_DATA frames, taking turns with DATA.
  *
  * It also watches the GDB port: a GDB client is handed to the SWD owner task when no NETWORK PROBE client is connected, and
  * refused otherwise. During a GDB session every request but HELLO is answered BUSY.
@@ -35,8 +39,9 @@ class NetServer
 	 * allocated.
 	 * @param hostLink State shared with the SWD owner task; probeTask must be set.
 	 * @param gdbListenSocket The GDB server's listening socket, which the net task only watches.
+	 * @param swoCapture Set up by the net task when it starts, so its interrupt lands on the net task's core.
 	 */
-	void start(HostLink& hostLink, int gdbListenSocket);
+	void start(HostLink& hostLink, int gdbListenSocket, SwoCapture& swoCapture);
 
    private:
 	static constexpr uint32_t taskStackSize = 6144;
@@ -80,6 +85,12 @@ class NetServer
 	bool handleFrame(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
 
 	/**
+	 * @brief Executes SWO_START or SWO_STOP and prepares the answer.
+	 * @return False when the client broke the protocol.
+	 */
+	bool handleSwoRequest(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
+
+	/**
 	 * @brief Prepares an answer of the net task's own; its data, if any, is already at localData().
 	 * @return False when one is still waiting to be sent.
 	 */
@@ -106,7 +117,9 @@ class NetServer
 	bool nextFrame(int64_t now);
 
 	bool buildData(int64_t now);
+	bool buildSwoData(int64_t now);
 	bool buildEvent(int64_t now);
+	bool buildSwoEvent(int64_t now);
 	void buildEventFrame(NetworkProbe::Event event, uint32_t value);
 
 	/**
@@ -116,6 +129,7 @@ class NetServer
 	static size_t sealFrame(uint8_t* frame, NetworkProbe::Type type, uint16_t length, uint16_t seq);
 
 	HostLink* link = nullptr;
+	SwoCapture* swo = nullptr;
 	int listenSocket = -1;
 	int clientSocket = -1;
 	int gdbListenSocket = -1;
@@ -144,6 +158,13 @@ class NetServer
 	uint32_t reportedLost = 0;
 	int64_t lastOverflowEvent = 0;
 	int64_t lastErrorEvent = 0;
+
+	bool swoTurn = false; /**< SWO_DATA goes before DATA when both are due. */
+	int64_t lastSwoDataTime = 0;
+	uint32_t reportedSwoDropped = 0;
+	uint32_t reportedSwoErrors = 0;
+	int64_t lastSwoOverflowEvent = 0;
+	int64_t lastSwoErrorEvent = 0;
 };
 
 #endif /* NETSERVER_HPP */

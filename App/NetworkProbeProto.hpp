@@ -41,9 +41,12 @@ enum class Type : uint8_t
 	SET_PLAN = 0x10,
 	START = 0x11,
 	STOP = 0x12,
+	SWO_START = 0x13,
+	SWO_STOP = 0x14,
 	RESP = 0x80,
 	DATA = 0x81,
 	EVENT = 0x82,
+	SWO_DATA = 0x83,
 };
 
 enum class Status : uint8_t
@@ -73,6 +76,7 @@ constexpr uint32_t capSwd = 1UL << 0;
 constexpr uint32_t capReset = 1UL << 1;
 constexpr uint32_t capStream = 1UL << 2;
 constexpr uint32_t capCyccnt = 1UL << 3;
+constexpr uint32_t capSwo = 1UL << 4;
 
 /* GET_STATUS link state */
 enum class Link : uint8_t
@@ -87,6 +91,15 @@ enum class Event : uint8_t
 	TARGET_LOST = 1,     /* value 0: streaming stopped */
 	BUFFER_OVERFLOW = 2, /* value: samples dropped since START */
 	SAMPLE_ERRORS = 3,   /* value: samples lost to target errors since START */
+	SWO_OVERFLOW = 4,    /* value: SWO bytes dropped since SWO_START */
+	SWO_ERRORS = 5,      /* value: SWO receive errors since SWO_START */
+};
+
+/* SWO_START encoding: how the target's TPIU sends SWO */
+enum class SwoEncoding : uint8_t
+{
+	NRZ = 0, /* UART: 8 data bits, no parity, 1 stop bit */
+	MANCHESTER = 1,
 };
 
 /* DISCOVER session state */
@@ -101,6 +114,7 @@ enum class Session : uint8_t
 constexpr size_t respHeaderSize = 2;            /* u8 request, u8 status */
 constexpr size_t helloRequestSize = 2;          /* u16 protocol */
 constexpr size_t helloResponseFixedSize = 24;   /* up to and including clock_max; name, firmware and id follow */
+constexpr size_t helloSwoSize = 8;              /* u32 swo_min, u32 swo_max, after id, with capSwo */
 constexpr size_t connectRequestSize = 6;        /* u32 clock, u8 ap_sel, u8 flags */
 constexpr size_t connectResponseSize = 16;      /* u32 dpidr, u32 targetid, u32 ap_idr, u32 clock */
 constexpr size_t readRequestSize = 6;           /* u32 address, u16 length */
@@ -114,6 +128,9 @@ constexpr size_t planBlockSize = 7;             /* u32 address, u16 count, u8 ac
 constexpr size_t dataHeaderSize = 10;           /* u16 plan_id, u32 first_sample, u16 nsamples, u16 bytes_per_sample */
 constexpr size_t eventSize = 5;                 /* u8 event, u32 value */
 constexpr size_t sampleTimeSize = 4;            /* u32 t at the start of every sample record */
+constexpr size_t swoStartRequestSize = 6;       /* u32 baud, u8 encoding, u8 flags */
+constexpr size_t swoStartResponseSize = 4;      /* u32 baud */
+constexpr size_t swoDataHeaderSize = 4;         /* u32 first_byte, then the bytes */
 constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a multiple of 1 KiB */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */

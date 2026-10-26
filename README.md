@@ -7,13 +7,14 @@ The probe serves two kinds of clients, one session at a time:
 
 - **MCUViewer** over the NETWORK PROBE protocol (TCP port 2023). The probe connects to the
   target without halting it and reads and writes memory while it runs. In HSS mode it samples
-  on its own, with its own timestamps, and streams the samples.
+  on its own, with its own timestamps, and streams the samples. It also receives the target's
+  SWO pin and streams the trace bytes.
 - **GDB**: BMD's GDB server over Wi-Fi (TCP port 2022). Use it for flashing and validation.
 
 ## Hardware
 
 Reference board: Waveshare ESP32-S3-Pico. The defaults below can be changed in menuconfig
-under *NETWORK PROBE SWD / Black Magic Debug port*.
+under *NETWORK PROBE SWD / Black Magic Debug port* and *NETWORK PROBE SWO*.
 
 | Signal | GPIO | Pico header |
 |---|---|---|
@@ -21,6 +22,7 @@ under *NETWORK PROBE SWD / Black Magic Debug port*.
 | SWCLK | 12 | GP1 (pin 2) |
 | GND | – | pin 3 |
 | nRST (optional, open-drain) | 14 | GP3 (pin 5) |
+| SWO (optional, input) | 15 | GP4 (pin 6) |
 
 The target must run at 3.3 V and share ground with the probe.
 
@@ -89,6 +91,17 @@ The probe serves one client at a time. While MCUViewer is connected, GDB connect
 refused; while GDB is connected, MCUViewer gets no answer until the GDB session ends. A second
 MCUViewer connection takes over from the first.
 
+### SWO
+
+The probe receives SWO in NRZ (UART) encoding at up to 5 MBaud, with DMA, and passes the bytes
+on unchanged: the host decodes the ITM packets. Like with an ST-Link, the host sets up the
+target's trace unit (DEMCR, TPIU, ITM and the vendor's trace pin enable) itself, with memory
+writes over SWD; the probe only receives. The SWO clock is the core clock divided by the trace
+prescaler + 1, so pick a prescaler that keeps it at or below 5 MHz. SWO runs alongside HSS
+streaming, on the same connection.
+
+MCUViewer's trace viewer needs a NETWORK PROBE trace probe on its side to use this.
+
 ## Using GDB
 
 ```
@@ -110,8 +123,8 @@ The repository root is the ESP-IDF project (esp32s3). Its own components are reg
 App/                  probe application: Wi-Fi and mDNS, setup mode with the setup page
                       (SetupPortal) and the saved network (NetworkSettings), the net task
                       (NetServer), the SWD owner task with the GDB server, requests and
-                      streaming (ProbeService), light connect (TargetLink) and the protocol
-                      header shared with MCUViewer
+                      streaming (ProbeService), light connect (TargetLink), the SWO receiver
+                      (SwoCapture) and the protocol header shared with MCUViewer
 Platform/             BMD's ESP32-S3 platform port (SWD tap, GDB over TCP); builds BMD from
                       External/blackmagic
 External/blackmagic/  Black Magic Debug v2.1.0 (git submodule, pinned)

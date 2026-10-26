@@ -51,7 +51,7 @@ void App::runProbe()
 	gdbServer.init();
 	hostLink.probeTask = xTaskGetCurrentTaskHandle();
 	probeService.init(hostLink);
-	netServer.start(hostLink, gdbServer.getListenSocket());
+	netServer.start(hostLink, gdbServer.getListenSocket(), swoCapture);
 
 	while (true)
 	{

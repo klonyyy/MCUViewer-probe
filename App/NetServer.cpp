@@ -57,12 +57,14 @@ bool isRequest(const NetworkProbe::Type type)
 }
 }  // namespace
 
-void NetServer::start(HostLink& hostLink, const int gdbListen)
+void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCapture)
 {
-	static_assert(NetworkProbe::helloResponseFixedSize + 3U * (1U + UINT8_MAX) <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a HELLO answer must fit");
+	static_assert(NetworkProbe::helloResponseFixedSize + 3U * (1U + UINT8_MAX) + NetworkProbe::helloSwoSize <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a HELLO answer must fit");
 	static_assert(NetworkProbe::discoverResponseFixedSize + 3U * (1U + UINT8_MAX) <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a DISCOVER answer must fit");
+	static_assert(dataTargetPayload <= HostLink::maxPayload, "an SWO_DATA frame must fit");
 
 	link = &hostLink;
+	swo = &swoCapture;
 	gdbListenSocket = gdbListen;
 
 	NetworkSettings::getDeviceId(probeId, sizeof(probeId));
@@ -106,9 +108,13 @@ void NetServer::taskEntry(void* const arg)
 
 void NetServer::run()
 {
+	/* Here, not in start(): the DMA interrupt is allocated on the calling core */
+	swo->init();
+
 	while (true)
 	{
 		serviceLink();
+		swo->poll();
 		if (clientSocket >= 0 && !pumpTx())
 			closeClient();
 
@@ -143,8 +149,8 @@ void NetServer::run()
 			maxSocket = std::max(maxSocket, clientSocket);
 		}
 
-		/* Samples are flushed on time, so wake up regularly while they may come; the eventfd covers the rest */
-		const bool samplesMayCome = clientSocket >= 0 && (link->streaming.load(std::memory_order_acquire) || link->ring.available() > 0);
+		/* Samples and SWO bytes are flushed on time, so wake up regularly while they may come; the eventfd covers the rest */
+		const bool samplesMayCome = clientSocket >= 0 && (link->streaming.load(std::memory_order_acquire) || link->ring.available() > 0 || swo->isCapturing());
 		timeval timeout = {};
 		timeout.tv_usec = pollMs * 1000U;
 		const int ready = select(maxSocket + 1, &readSet, &writeSet, nullptr, samplesMayCome ? &timeout : nullptr);
@@ -225,6 +231,7 @@ void NetServer::closeClient()
 	localLength = 0;
 	if (requestOutstanding)
 		dropResponse = true;
+	swo->stop();
 
 	/* The SWD owner task stops streaming and releases the target; the samples left belong to no one */
 	link->sessionGeneration.fetch_add(1, std::memory_order_acq_rel);
@@ -375,6 +382,8 @@ bool NetServer::handleFrame(const NetworkProbe::FrameHeader& header, const uint8
 		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::BUSY, 0);
 	if (requestOutstanding || link->slotState.load(std::memory_order_acquire) != HostLink::SlotState::empty)
 		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::BUSY, 0);
+	if (header.type == NetworkProbe::Type::SWO_START || header.type == NetworkProbe::Type::SWO_STOP)
+		return handleSwoRequest(header, payload);
 
 	link->requestType = header.type;
 	link->requestSeq = header.seq;
@@ -385,6 +394,35 @@ bool NetServer::handleFrame(const NetworkProbe::FrameHeader& header, const uint8
 	link->slotState.store(HostLink::SlotState::request, std::memory_order_release);
 	link->wakeProbe();
 	return true;
+}
+
+bool NetServer::handleSwoRequest(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
+{
+	if (!swo->isAvailable())
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::UNSUPPORTED, 0);
+
+	if (header.type == NetworkProbe::Type::SWO_STOP)
+	{
+		if (header.length != 0)
+			return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::MALFORMED, 0);
+		swo->stop();
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::OK, 0);
+	}
+
+	if (header.length != NetworkProbe::swoStartRequestSize || payload[5] != 0)
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::MALFORMED, 0);
+	if (payload[4] != NetworkProbe::toByte(NetworkProbe::SwoEncoding::NRZ))
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::UNSUPPORTED, 0);
+	const uint32_t baud = NetworkProbe::getU32(payload);
+	if (baud < SwoCapture::minBaud || baud > SwoCapture::maxBaud)
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::MALFORMED, 0);
+
+	/* The ring is empty now, so no SWO_DATA of the previous capture follows the answer */
+	const uint32_t actual = swo->start(baud);
+	reportedSwoDropped = 0;
+	reportedSwoErrors = 0;
+	NetworkProbe::putU32(localData(), actual);
+	return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::OK, NetworkProbe::swoStartResponseSize);
 }
 
 bool NetServer::queueLocalResponse(const uint16_t seq, const NetworkProbe::Type request, const NetworkProbe::Status status, const uint16_t dataLength)
@@ -405,7 +443,7 @@ uint16_t NetServer::buildHello(uint8_t* const data) const
 {
 	NetworkProbe::putU16(data, NetworkProbe::protocolVersion);
 	NetworkProbe::putU16(data + 2, HostLink::maxPayload);
-	NetworkProbe::putU32(data + 4, NetworkProbe::capSwd | NetworkProbe::capReset | NetworkProbe::capStream);
+	NetworkProbe::putU32(data + 4, NetworkProbe::capSwd | NetworkProbe::capReset | NetworkProbe::capStream | (swo->isAvailable() ? NetworkProbe::capSwo : 0U));
 	NetworkProbe::putU16(data + 8, HostLink::maxRead);
 	data[10] = HostLink::maxList;
 	data[11] = HostLink::maxBlocks;
@@ -418,6 +456,13 @@ uint16_t NetServer::buildHello(uint8_t* const data) const
 	out = putString(out, probeName);
 	out = putString(out, esp_app_get_description()->version);
 	out = putString(out, probeId);
+	/* Fields of the capabilities after the strings, in the order of their bits */
+	if (swo->isAvailable())
+	{
+		NetworkProbe::putU32(out, SwoCapture::minBaud);
+		NetworkProbe::putU32(out + 4, SwoCapture::maxBaud);
+		out += NetworkProbe::helloSwoSize;
+	}
 	return static_cast<uint16_t>(out - data);
 }
 
@@ -492,7 +537,12 @@ bool NetServer::nextFrame(const int64_t now)
 		return true;
 	}
 
-	return buildEvent(now) || buildData(now);
+	if (buildEvent(now) || buildSwoEvent(now))
+		return true;
+
+	/* DATA and SWO_DATA take turns, so neither waits behind a backlog of the other */
+	swoTurn = !swoTurn;
+	return swoTurn ? (buildSwoData(now) || buildData(now)) : (buildData(now) || buildSwoData(now));
 }
 
 bool NetServer::buildEvent(const int64_t now)
@@ -521,6 +571,30 @@ bool NetServer::buildEvent(const int64_t now)
 		reportedErrors = errors;
 		lastErrorEvent = now;
 		buildEventFrame(NetworkProbe::Event::SAMPLE_ERRORS, errors);
+		return true;
+	}
+	return false;
+}
+
+bool NetServer::buildSwoEvent(const int64_t now)
+{
+	if (!swo->isCapturing())
+		return false;
+
+	const uint32_t dropped = swo->getDroppedBytes();
+	if (dropped != reportedSwoDropped && now - lastSwoOverflowEvent >= eventIntervalUs)
+	{
+		reportedSwoDropped = dropped;
+		lastSwoOverflowEvent = now;
+		buildEventFrame(NetworkProbe::Event::SWO_OVERFLOW, dropped);
+		return true;
+	}
+	const uint32_t errors = swo->getErrors();
+	if (errors != reportedSwoErrors && now - lastSwoErrorEvent >= eventIntervalUs)
+	{
+		reportedSwoErrors = errors;
+		lastSwoErrorEvent = now;
+		buildEventFrame(NetworkProbe::Event::SWO_ERRORS, errors);
 		return true;
 	}
 	return false;
@@ -574,6 +648,25 @@ bool NetServer::buildData(const int64_t now)
 
 	lastDataTime = now;
 	txLength = sealFrame(txFrame.data(), NetworkProbe::Type::DATA, static_cast<uint16_t>(out - payload), frameSeq++);
+	return true;
+}
+
+bool NetServer::buildSwoData(const int64_t now)
+{
+	const size_t buffered = swo->getBuffered();
+	if (!buffered || (buffered < dataTargetPayload && now - lastSwoDataTime < dataFlushUs))
+		return false;
+
+	/* One frame holds consecutive bytes only */
+	uint8_t* const payload = txFrame.data() + NetworkProbe::headerSize;
+	uint32_t first = 0;
+	const size_t length = swo->read(payload + NetworkProbe::swoDataHeaderSize, dataTargetPayload - NetworkProbe::swoDataHeaderSize, first);
+	if (!length)
+		return false;
+	NetworkProbe::putU32(payload, first);
+
+	lastSwoDataTime = now;
+	txLength = sealFrame(txFrame.data(), NetworkProbe::Type::SWO_DATA, static_cast<uint16_t>(NetworkProbe::swoDataHeaderSize + length), frameSeq++);
 	return true;
 }
 
