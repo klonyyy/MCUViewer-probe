@@ -97,6 +97,13 @@ class Wifi
 
 	const char* getDeviceId() const { return deviceId; }
 
+	/**
+	 * @brief Copies the hostname the probe uses now on DHCP and mDNS, without ".local". Callable from any task.
+	 * @param hostname Receives the hostname.
+	 * @param size Size of hostname, with the terminator.
+	 */
+	void getHostname(char* hostname, size_t size);
+
    private:
 	static constexpr EventBits_t readyBit = BIT0; /**< The station has an address, or the setup access point is up. */
 	static constexpr uint8_t apMaxConnections = 2;
@@ -189,7 +196,6 @@ class Wifi
 	/* Wi-Fi task */
 	NetworkSettings saved;	   /**< Joined at boot and retried in setup mode. */
 	NetworkSettings candidate; /**< What the join tries. */
-	char activeHostname[NetworkSettings::maxHostnameLength + 1] = {};
 	bool wifiStarted = false;
 	bool setupMode = false;
 	bool staBusy = false;	/**< Connecting or connected: another connection needs a disconnection first. */
@@ -206,9 +212,10 @@ class Wifi
 	Deadline closeDeadline;
 	Deadline buttonDeadline;
 
-	/* Shared with the setup page */
+	/* Shared with the setup page, and activeHostname with the net task */
 	std::mutex statusLock;
 	Status status;
+	char activeHostname[NetworkSettings::maxHostnameLength + 1] = {}; /**< Written only by applyHostname(). */
 	NetworkSettings requested; /**< The join from the setup page, for the Wi-Fi task. */
 	Network networks[maxNetworks] = {};
 	size_t networkCount = 0;

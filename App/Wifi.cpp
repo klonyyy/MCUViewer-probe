@@ -108,6 +108,12 @@ Wifi::Status Wifi::getStatus()
 	return status;
 }
 
+void Wifi::getHostname(char* const hostname, const size_t size)
+{
+	std::lock_guard<std::mutex> lock(statusLock);
+	strlcpy(hostname, activeHostname, size);
+}
+
 void Wifi::requestScan(const bool force)
 {
 	{
@@ -332,7 +338,10 @@ void Wifi::applyHostname(const char* const hostname)
 {
 	if (!strcmp(activeHostname, hostname))
 		return;
-	strlcpy(activeHostname, hostname, sizeof(activeHostname));
+	{
+		std::lock_guard<std::mutex> lock(statusLock);
+		strlcpy(activeHostname, hostname, sizeof(activeHostname));
+	}
 	/* The DHCP client sends it from the next connection on */
 	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_set_hostname(staNetif, activeHostname));
 	ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_hostname_set(activeHostname));

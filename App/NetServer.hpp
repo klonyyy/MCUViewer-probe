@@ -15,6 +15,8 @@
 #include "NetworkProbeProto.hpp"
 #include "SwoCapture.hpp"
 
+class Wifi;
+
 /**
  * @brief The net task, on core 0: the network side of the NETWORK PROBE protocol.
  *
@@ -29,7 +31,7 @@
  * It also watches the GDB port: a GDB client is handed to the SWD owner task when no NETWORK PROBE client is connected, and
  * refused otherwise. During a GDB session every request but HELLO is answered BUSY.
  *
- * Discovery: it answers DISCOVER datagrams on the UDP discovery port itself, in every session state.
+ * Discovery: it answers DISCOVER and IDENTIFY datagrams on the UDP discovery port itself, in every session state.
  */
 class NetServer
 {
@@ -40,8 +42,9 @@ class NetServer
 	 * @param hostLink State shared with the SWD owner task; probeTask must be set.
 	 * @param gdbListenSocket The GDB server's listening socket, which the net task only watches.
 	 * @param swoCapture Set up by the net task when it starts, so its interrupt lands on the net task's core.
+	 * @param network The Wi-Fi, which tells the hostname that DISCOVER answers with.
 	 */
-	void start(HostLink& hostLink, int gdbListenSocket, SwoCapture& swoCapture);
+	void start(HostLink& hostLink, int gdbListenSocket, SwoCapture& swoCapture, Wifi& network);
 
    private:
 	static constexpr uint32_t taskStackSize = 6144;
@@ -53,6 +56,8 @@ class NetServer
 	static constexpr uint32_t pollMs = 5;			   /**< Wake-up period while samples may come. */
 	static constexpr size_t bufferSize = NetworkProbe::frameOverhead + HostLink::maxPayload;
 	static constexpr size_t localFrameSize = 1024; /**< HELLO, BUSY and other answers the net task gives itself. */
+	/** A DISCOVER answer, with its four strings at their longest. */
+	static constexpr size_t discoveryFrameSize = NetworkProbe::frameOverhead + NetworkProbe::respHeaderSize + NetworkProbe::discoverResponseFixedSize + 4 * (1 + UINT8_MAX);
 
 	static void taskEntry(void* arg);
 	[[noreturn]] void run();
@@ -67,9 +72,10 @@ class NetServer
 	void openDiscoverySocket();
 
 	/**
-	 * @brief Reads one datagram from the discovery port and answers it if it is a well-formed DISCOVER.
+	 * @brief Reads one datagram from the discovery port and answers it if it is a well-formed DISCOVER, or an IDENTIFY
+	 * with this probe's id.
 	 */
-	void answerDiscovery();
+	void answerDatagram();
 
 	uint16_t buildDiscover(uint8_t* data) const;
 
@@ -136,13 +142,16 @@ class NetServer
 
 	HostLink* link = nullptr;
 	SwoCapture* swo = nullptr;
+	Wifi* wifi = nullptr;
 	int listenSocket = -1;
 	int clientSocket = -1;
 	int gdbListenSocket = -1;
 	int discoverySocket = -1;
 	char probeId[32] = {};
 
-	std::array<uint8_t, localFrameSize> discoveryFrame; /**< A DISCOVER answer; localFrame may hold a TCP answer meanwhile. */
+	/** A datagram from the discovery port: one byte more than the longest request, an IDENTIFY, so a longer one shows by its size. */
+	std::array<uint8_t, NetworkProbe::frameOverhead + 1 + UINT8_MAX + 1> discoveryRequest;
+	std::array<uint8_t, discoveryFrameSize> discoveryFrame; /**< Its answer; localFrame may hold a TCP answer meanwhile. */
 
 	std::array<uint8_t, bufferSize> rxBuffer;
 	size_t rxLength = 0;

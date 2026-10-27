@@ -38,6 +38,7 @@ enum class Type : uint8_t
 	RESET = 0x07,
 	GET_STATUS = 0x08,
 	DISCOVER = 0x09, /* over UDP only */
+	IDENTIFY = 0x0A, /* over UDP only */
 	SET_PLAN = 0x10,
 	START = 0x11,
 	STOP = 0x12,
@@ -125,7 +126,7 @@ constexpr size_t writeRequestHeaderSize = 6;    /* u32 address, u16 length, then
 constexpr size_t readListEntrySize = 5;         /* u32 address, u8 size; the request starts with u8 count */
 constexpr size_t statusResponseSize = 16;       /* u8 link, u8 reserved[3], u32 clock, u32 target_errors, u32 uptime_ms */
 constexpr size_t discoverRequestSize = 2;       /* u16 protocol */
-constexpr size_t discoverResponseFixedSize = 6; /* u16 protocol, u16 tcp_port, u8 session, u8 reserved; name, firmware and id follow */
+constexpr size_t discoverResponseFixedSize = 6; /* u16 protocol, u16 tcp_port, u8 session, u8 reserved; name, firmware, id and hostname follow */
 constexpr size_t planHeaderSize = 7;            /* u16 plan_id, u32 period_us, u8 nblocks */
 constexpr size_t planBlockSize = 7;             /* u32 address, u16 count, u8 access_size */
 constexpr size_t dataHeaderSize = 10;           /* u16 plan_id, u32 first_sample, u16 nsamples, u16 bytes_per_sample */
@@ -143,6 +144,11 @@ constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a
  * READ_BULK reads length bytes from address with the widest access of 4, 2 or 1 bytes that divides both, like READ.
  * The probe sends the bytes in order, in READ_DATA frames of at most max_payload, then the RESP: OK without data once
  * every byte went out, or TARGET_ERROR when an access failed, after the READ_DATA of the bytes read before it.
+ */
+
+/*
+ * IDENTIFY carries the id of the probe it is meant for, as a string. That probe blinks its LED for a few seconds and
+ * answers OK without data; any other probe drops it. Like DISCOVER, it is answered in every session state.
  */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */

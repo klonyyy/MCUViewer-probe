@@ -37,6 +37,8 @@ constexpr int64_t activityDipMs = 40;  /**< A dip for traffic... */
 constexpr int64_t activityGapMs = 100; /**< ...at most this often, so a stream of frames flickers at 10 Hz. */
 constexpr float activityLevel = 0.05f;
 
+constexpr int64_t identifyMs = 2000;
+
 struct Color
 {
 	uint8_t r;
@@ -90,6 +92,7 @@ std::atomic<bool> hostConnected{false};
 std::atomic<bool> gdbConnected{false};
 std::atomic<uint32_t> buttonRemainingMs{0};
 std::atomic<bool> activityPending{false};
+std::atomic<bool> identifyPending{false};
 std::atomic<StatusLed::Alert> pendingAlert{StatusLed::Alert::none}; /**< The most severe since the LED task looked. */
 
 /* LED task */
@@ -100,6 +103,8 @@ StatusLed::Alert activeAlert = StatusLed::Alert::none;
 int64_t alertStart = 0;
 int64_t activityDipEnd = 0;
 int64_t nextActivity = 0;
+int64_t identifyStart = 0;
+int64_t identifyEnd = 0;
 float holdPhase = 0.0f; /**< Of the button hold blinks, 0 to 1. */
 
 /* A WS2812 bit: high, then low */
@@ -201,6 +206,16 @@ void updateActivity(const int64_t nowMs)
 	}
 }
 
+void updateIdentify(const int64_t nowMs)
+{
+	if (!identifyPending.exchange(false, std::memory_order_relaxed))
+		return;
+	/* A request while it blinks makes it longer without breaking the rhythm */
+	if (nowMs >= identifyEnd)
+		identifyStart = nowMs;
+	identifyEnd = nowMs + identifyMs;
+}
+
 Look buttonLook(const uint32_t remainingMs)
 {
 	/* Twice a second when pressed, about 12 times a second at the end */
@@ -231,14 +246,18 @@ Look networkLook(const int64_t nowMs)
 
 Look render(const int64_t nowMs)
 {
-	/* Alerts and traffic are taken in every frame, also while something else is shown */
+	/* Alerts, traffic and identification are taken in every frame, also while something else is shown */
 	updateAlert(nowMs);
 	updateActivity(nowMs);
+	updateIdentify(nowMs);
 
 	const uint32_t remainingMs = buttonRemainingMs.load(std::memory_order_relaxed);
 	if (remainingMs)
 		return buttonLook(remainingMs);
 	holdPhase = 0.0f;
+
+	if (nowMs < identifyEnd)
+		return {white, blink(nowMs - identifyStart, 100, 200)};
 
 	if (activeAlert != StatusLed::Alert::none)
 	{
@@ -304,6 +323,11 @@ void StatusLed::setGdbConnected(const bool connected)
 void StatusLed::setButtonHold(const uint32_t remainingMs)
 {
 	buttonRemainingMs.store(remainingMs, std::memory_order_relaxed);
+}
+
+void StatusLed::identify()
+{
+	identifyPending.store(true, std::memory_order_relaxed);
 }
 
 void StatusLed::activity()

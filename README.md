@@ -50,8 +50,10 @@ order.
 | one red flash | an access to the target failed, or no target answered |
 | four red blinks | the target was lost, or a join from the setup page failed |
 | white, speeding up | the BOOT button is held: on release before the end nothing happens |
+| white, fast blinks for 2 s | MCUViewer asked which probe this is (the bulb button next to the probe list) |
 
-Alerts show over the session and the network; the held button shows over everything.
+Alerts show over the session and the network, identification over alerts, and the held button
+over everything.
 
 ## Building the firmware
 
@@ -93,7 +95,10 @@ characters).
 
 ## Using MCUViewer (from v1.4.0)
 
-In the acquisition settings pick the debug probe **NETWORK_PROBE** and enter:
+In the acquisition settings pick the debug probe **NETWORK_PROBE**. The **Probe** list shows the
+probes on the local network by hostname; picking one fills in its address and port, and the bulb
+button next to the list blinks the picked probe's LED, to tell several probes apart. A probe in
+another subnet is not listed; enter:
 
 - **Address**: the hostname with `.local`, by default `network-probe-xxxxxx.local`, or the IP
   address shown on the setup page or in the boot log;

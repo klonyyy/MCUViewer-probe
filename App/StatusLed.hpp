@@ -13,6 +13,7 @@
  *
  * It shows the first of these that applies:
  * - the setup button held: white blinks that speed up until the saved network is forgotten;
+ * - identification: fast white blinks for a few seconds, when a host asked which probe this is;
  * - an alert: one amber flash when samples or SWO bytes were dropped, one red flash when an access to the target
  *   failed, red blinks when the target was lost or a Wi-Fi join failed;
  * - a GDB session: orange, dipping briefly for the packets;
@@ -58,6 +59,12 @@ class StatusLed
 	 * @param remainingMs Until the hold takes effect; 0 when the button is released.
 	 */
 	static void setButtonHold(uint32_t remainingMs);
+
+	/**
+	 * @brief Blinks the LED white for a few seconds, so the user can tell this probe from the others. A call while it
+	 * blinks makes it blink longer.
+	 */
+	static void identify();
 
 	/**
 	 * @brief Marks traffic of the session: a frame or a packet. A burst shows as one dip.

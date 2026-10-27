@@ -16,6 +16,7 @@
 #include "NetworkSettings.hpp"
 #include "StatusLed.hpp"
 #include "SwdTap.hpp"
+#include "Wifi.hpp"
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_rom_crc.h"
@@ -73,15 +74,15 @@ StatusLed::Alert alertFor(const NetworkProbe::Event event)
 }
 }  // namespace
 
-void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCapture)
+void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCapture, Wifi& network)
 {
 	static_assert(NetworkProbe::helloResponseFixedSize + 3U * (1U + UINT8_MAX) + NetworkProbe::helloSwoSize <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a HELLO answer must fit");
-	static_assert(NetworkProbe::discoverResponseFixedSize + 3U * (1U + UINT8_MAX) <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a DISCOVER answer must fit");
 	static_assert(dataTargetPayload <= HostLink::maxPayload, "an SWO_DATA frame must fit");
 	static_assert(NetworkProbe::readDataHeaderSize + HostLink::bulkChunkSize <= HostLink::maxPayload, "a READ_DATA frame must fit");
 
 	link = &hostLink;
 	swo = &swoCapture;
+	wifi = &network;
 	gdbListenSocket = gdbListen;
 
 	NetworkSettings::getDeviceId(probeId, sizeof(probeId));
@@ -186,7 +187,7 @@ void NetServer::run()
 		if (FD_ISSET(listenSocket, &readSet))
 			acceptClient();
 		if (discoverySocket >= 0 && FD_ISSET(discoverySocket, &readSet))
-			answerDiscovery();
+			answerDatagram();
 		if (watchGdb && FD_ISSET(gdbListenSocket, &readSet))
 		{
 			if (clientSocket >= 0)
@@ -293,33 +294,43 @@ void NetServer::openDiscoverySocket()
 	ESP_LOGE(tag, "cannot open UDP port %u for discovery: errno %d", NetworkProbe::discoveryPort, errno);
 }
 
-void NetServer::answerDiscovery()
+void NetServer::answerDatagram()
 {
-	/* One byte more than a DISCOVER frame, so a longer datagram shows by its size */
-	uint8_t request[NetworkProbe::frameOverhead + NetworkProbe::discoverRequestSize + 1];
+	uint8_t* const request = discoveryRequest.data();
 	sockaddr_in peer;
 	socklen_t peerLength = sizeof(peer);
-	const ssize_t received = recvfrom(discoverySocket, request, sizeof(request), 0, reinterpret_cast<sockaddr*>(&peer), &peerLength);
-	if (received != static_cast<ssize_t>(NetworkProbe::frameOverhead + NetworkProbe::discoverRequestSize))
+	const ssize_t received = recvfrom(discoverySocket, request, discoveryRequest.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peerLength);
+	if (received < static_cast<ssize_t>(NetworkProbe::frameOverhead) || received == static_cast<ssize_t>(discoveryRequest.size()))
 		return;
 
 	NetworkProbe::FrameHeader header;
-	if (!NetworkProbe::decodeHeader(request, header) || header.type != NetworkProbe::Type::DISCOVER || header.length != NetworkProbe::discoverRequestSize)
+	if (!NetworkProbe::decodeHeader(request, header) || received != static_cast<ssize_t>(NetworkProbe::frameOverhead + header.length))
 		return;
 	if (NetworkProbe::getU32(request + NetworkProbe::headerSize + header.length) != esp_rom_crc32_le(0, request, NetworkProbe::headerSize + header.length))
 		return;
 
 	uint8_t* const frame = discoveryFrame.data();
-	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(NetworkProbe::Type::DISCOVER);
+	const uint8_t* const payload = request + NetworkProbe::headerSize;
+	uint16_t dataLength = 0;
+	if (header.type == NetworkProbe::Type::DISCOVER && header.length == NetworkProbe::discoverRequestSize)
+		dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize);
+	else if (header.type == NetworkProbe::Type::IDENTIFY && header.length == 1U + payload[0] && payload[0] == strlen(probeId) && !memcmp(payload + 1, probeId, payload[0]))
+		StatusLed::identify();
+	else
+		return;
+
+	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(header.type);
 	frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(NetworkProbe::Status::OK);
-	const uint16_t dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize);
 	const size_t length = sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + dataLength, header.seq);
 	/* Non-blocking: with the send buffer full the answer is dropped, and the host asks again */
 	sendto(discoverySocket, frame, length, 0, reinterpret_cast<const sockaddr*>(&peer), peerLength);
 
 	char peerName[16];
 	inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
-	ESP_LOGD(tag, "answered DISCOVER from %s", peerName);
+	if (header.type == NetworkProbe::Type::IDENTIFY)
+		ESP_LOGI(tag, "identifying, as %s asked", peerName);
+	else
+		ESP_LOGD(tag, "answered DISCOVER from %s", peerName);
 }
 
 uint16_t NetServer::buildDiscover(uint8_t* const data) const
@@ -335,10 +346,14 @@ uint16_t NetServer::buildDiscover(uint8_t* const data) const
 	data[4] = NetworkProbe::toByte(session);
 	data[5] = 0;
 
+	char hostname[NetworkSettings::maxHostnameLength + 1];
+	wifi->getHostname(hostname, sizeof(hostname));
+
 	uint8_t* out = data + NetworkProbe::discoverResponseFixedSize;
 	out = putString(out, probeName);
 	out = putString(out, esp_app_get_description()->version);
 	out = putString(out, probeId);
+	out = putString(out, hostname);
 	return static_cast<uint16_t>(out - data);
 }
 
