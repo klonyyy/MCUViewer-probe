@@ -66,12 +66,12 @@ menu "NETWORK PROBE SWO"
     config NETWORK_PROBE_SWO_GPIO
         int "SWO GPIO (-1 = no SWO)"
         range -1 48
-        default 15
+        default 6
         help
             Input for the target's SWO pin, received in NRZ (UART) encoding by UART1
-            with DMA, up to 5 MBaud. The default GPIO15 is header pin GP4 (physical
-            pin 6) on the Waveshare ESP32-S3-Pico, next to nRST. The internal pull-up
-            keeps the line idle while the target does not drive it.
+            with DMA, up to 5 MBaud. UART1 reaches the pin through the GPIO matrix, so
+            any free GPIO works. The internal pull-up keeps the line idle while the
+            target does not drive it.
 
     config NETWORK_PROBE_SWO_BUFFER_KB
         int "SWO buffer (KiB)"
@@ -81,5 +81,39 @@ menu "NETWORK PROBE SWO"
             Buffer between the SWO receiver and the network, in PSRAM, rounded down
             to a power of two. It bridges Wi-Fi stalls: at 2 MBaud (200 kB/s) 256 KiB
             holds about 1.3 s. Without PSRAM a 16 KiB buffer in internal RAM is used.
+
+endmenu
+
+menu "NETWORK PROBE status LED"
+
+    config NETWORK_PROBE_LED_GPIO
+        int "Status LED GPIO (-1 = none)"
+        range -1 48
+        default 21
+        help
+            Data input of a WS2812 RGB LED, driven by RMT. It shows the network, the
+            MCUViewer or GDB session, the traffic and errors. The default GPIO21 is
+            the RGB LED of the Waveshare ESP32-S3-Pico.
+
+    config NETWORK_PROBE_LED_BRIGHTNESS
+        int "Status LED brightness"
+        range 1 255
+        default 48
+        help
+            Full scale of every color. A WS2812 at 255 is glaring on a desk.
+
+    choice NETWORK_PROBE_LED_ORDER
+        prompt "Status LED color order"
+        default NETWORK_PROBE_LED_ORDER_RGB
+        help
+            Byte order the LED expects. If red shows as green, pick the other one.
+
+        config NETWORK_PROBE_LED_ORDER_RGB
+            bool "RGB (Waveshare ESP32-S3-Pico)"
+
+        config NETWORK_PROBE_LED_ORDER_GRB
+            bool "GRB (most WS2812)"
+
+    endchoice
 
 endmenu

@@ -12,6 +12,7 @@
 #include "GdbServer.hpp"
 
 #include "GdbTcpInterface.hpp"
+#include "StatusLed.hpp"
 
 extern "C"
 {
@@ -54,6 +55,7 @@ void GdbServer::serve()
 				target_list_free();
 				gdb_outf("Uncaught exception: %s\n", exception_frame.msg);
 				morse("TARGET LOST.", true);
+				StatusLed::alert(StatusLed::Alert::failure);
 		}
 	}
 }
@@ -76,6 +78,7 @@ void GdbServer::pollLoop()
 
 	SET_IDLE_STATE(true);
 	const gdb_packet_s* const packet = gdb_packet_receive();
+	StatusLed::activity();
 	/* If port closed and target detached, stay idle */
 	if (packet->data[0] != '\x04' || cur_target)
 		SET_IDLE_STATE(false);

@@ -16,15 +16,35 @@ The probe serves two kinds of clients, one session at a time:
 Reference board: Waveshare ESP32-S3-Pico. The defaults below can be changed in menuconfig
 under *NETWORK PROBE SWD / Black Magic Debug port* and *NETWORK PROBE SWO*.
 
-| Signal | GPIO | Pico header |
-|---|---|---|
-| SWDIO | 11 | GP0 (pin 1) |
-| SWCLK | 12 | GP1 (pin 2) |
-| GND | – | pin 3 |
-| nRST (optional, open-drain) | 14 | GP3 (pin 5) |
-| SWO (optional, input) | 15 | GP4 (pin 6) |
+| Signal | GPIO |
+|---|---|
+| SWDIO | 4 |
+| SWCLK | 5 |
+| SWO (optional, input) | 6 |
+| nRST (optional, open-drain) | 10 |
+| GND | any GND pin |
 
 The target must run at 3.3 V and share ground with the probe.
+
+### Status LED
+
+The board's RGB LED (a WS2812 on GPIO21) shows what the probe does. GPIO, brightness and color
+order are under *NETWORK PROBE status LED* in menuconfig; if red shows as green, switch the color
+order.
+
+| LED | Meaning |
+|---|---|
+| blue, short blinks | joining the Wi-Fi network |
+| purple, breathing | setup mode: the access point is up |
+| green, slow breathing | on the network, no client |
+| cyan | MCUViewer connected; it dips briefly for the frames sent, so streaming flickers evenly |
+| orange | GDB session; it dips briefly for the packets |
+| one amber flash | samples or SWO bytes were dropped (buffer overflow) |
+| one red flash | an access to the target failed, or no target answered |
+| four red blinks | the target was lost, or a join from the setup page failed |
+| white, speeding up | the BOOT button is held: on release before the end nothing happens |
+
+Alerts show over the session and the network; the held button shows over everything.
 
 ## Building the firmware
 
@@ -124,7 +144,8 @@ App/                  probe application: Wi-Fi and mDNS, setup mode with the set
                       (SetupPortal) and the saved network (NetworkSettings), the net task
                       (NetServer), the SWD owner task with the GDB server, requests and
                       streaming (ProbeService), light connect (TargetLink), the SWO receiver
-                      (SwoCapture) and the protocol header shared with MCUViewer
+                      (SwoCapture), the status LED (StatusLed) and the protocol header shared
+                      with MCUViewer
 Platform/             BMD's ESP32-S3 platform port (SWD tap, GDB over TCP); builds BMD from
                       External/blackmagic
 External/blackmagic/  Black Magic Debug v2.1.0 (git submodule, pinned)

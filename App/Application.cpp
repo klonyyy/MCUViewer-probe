@@ -5,6 +5,7 @@
 
 #include "Application.hpp"
 
+#include "StatusLed.hpp"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,6 +26,9 @@ constexpr const char* tag = "network_probe";
 
 void App::init()
 {
+	/* First, so the LED shows the network coming up */
+	StatusLed::start();
+
 	esp_err_t result = nvs_flash_init();
 	if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND)
 	{
@@ -62,7 +66,9 @@ void App::runProbe()
 		if (hostLink.gdbRequested.load(std::memory_order_acquire))
 		{
 			hostLink.gdbActive.store(true, std::memory_order_release);
+			StatusLed::setGdbConnected(true);
 			gdbServer.serve();
+			StatusLed::setGdbConnected(false);
 			hostLink.gdbActive.store(false, std::memory_order_release);
 			hostLink.gdbRequested.store(false, std::memory_order_release);
 			hostLink.wakeNet();

@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 
+#include "StatusLed.hpp"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -165,6 +166,9 @@ void Wifi::run()
 	boot();
 	while (true)
 	{
+		/* A join from the setup page shows as connecting, though the access point stays up */
+		StatusLed::setNetwork(hasIp ? StatusLed::Network::online : (setupMode && !joining ? StatusLed::Network::setup : StatusLed::Network::connecting));
+
 		Message message;
 		if (xQueueReceive(queue, &message, ticksUntilDeadline()) == pdTRUE)
 			handle(message);
@@ -463,6 +467,7 @@ void Wifi::onJoinTimeout()
 void Wifi::finishJoin(const char* const error)
 {
 	ESP_LOGW(tag, "joining \"%s\" failed: %s", candidate.ssid, error);
+	StatusLed::alert(StatusLed::Alert::failure);
 	joining = false;
 	joinDeadline.disarm();
 	{
@@ -552,6 +557,7 @@ void Wifi::pollButton(const int64_t now)
 		NetworkSettings::erase();
 		esp_restart();
 	}
+	StatusLed::setButtonHold(buttonPressedAt ? buttonHoldMs - static_cast<uint32_t>((now - buttonPressedAt) / 1000) : 0);
 	buttonDeadline.arm(buttonPollMs);
 #endif
 }

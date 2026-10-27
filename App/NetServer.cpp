@@ -14,6 +14,7 @@
 #include <algorithm>
 
 #include "NetworkSettings.hpp"
+#include "StatusLed.hpp"
 #include "SwdTap.hpp"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -54,6 +55,21 @@ void configureClientSocket(const int sock)
 bool isRequest(const NetworkProbe::Type type)
 {
 	return type < NetworkProbe::Type::RESP;
+}
+
+/* The LED flashes what the host is told */
+StatusLed::Alert alertFor(const NetworkProbe::Event event)
+{
+	switch (event)
+	{
+		case NetworkProbe::Event::TARGET_LOST:
+			return StatusLed::Alert::failure;
+		case NetworkProbe::Event::BUFFER_OVERFLOW:
+		case NetworkProbe::Event::SWO_OVERFLOW:
+			return StatusLed::Alert::warning;
+		default:
+			return StatusLed::Alert::error;
+	}
 }
 }  // namespace
 
@@ -210,6 +226,7 @@ void NetServer::acceptClient()
 	inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
 	ESP_LOGI(tag, "client connected from %s", peerName);
 	clientSocket = sock;
+	StatusLed::setHostConnected(true);
 	rxLength = 0;
 	txLength = 0;
 	txSent = 0;
@@ -226,6 +243,7 @@ void NetServer::closeClient()
 		ESP_LOGI(tag, "client disconnected");
 	}
 	clientSocket = -1;
+	StatusLed::setHostConnected(false);
 	rxLength = 0;
 	txLength = 0;
 	txSent = 0;
@@ -502,8 +520,12 @@ bool NetServer::pumpTx()
 	const int64_t now = esp_timer_get_time();
 	while (true)
 	{
-		if (txSent == txLength && !nextFrame(now))
-			return true;
+		if (txSent == txLength)
+		{
+			if (!nextFrame(now))
+				return true;
+			StatusLed::activity();
+		}
 
 		/* Partial sends are resumed from txSent; EAGAIN leaves the frame for the next select() round */
 		while (txSent < txLength)
@@ -550,6 +572,8 @@ bool NetServer::nextFrame(const int64_t now)
 			frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(link->responseStatus);
 			memcpy(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize, link->responseData, link->responseLength);
 			txLength = sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + link->responseLength, link->requestSeq);
+			if (link->responseStatus == NetworkProbe::Status::TARGET_ERROR || link->responseStatus == NetworkProbe::Status::NO_TARGET)
+				StatusLed::alert(StatusLed::Alert::error);
 			requestOutstanding = false;
 			link->slotState.store(HostLink::SlotState::empty, std::memory_order_release);
 			return true;
@@ -645,6 +669,7 @@ void NetServer::buildEventFrame(const NetworkProbe::Event event, const uint32_t 
 	payload[0] = NetworkProbe::toByte(event);
 	NetworkProbe::putU32(payload + 1, value);
 	txLength = sealFrame(txFrame.data(), NetworkProbe::Type::EVENT, NetworkProbe::eventSize, frameSeq++);
+	StatusLed::alert(alertFor(event));
 }
 
 bool NetServer::buildData(const int64_t now)

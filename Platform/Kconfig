@@ -3,30 +3,25 @@ menu "NETWORK PROBE SWD / Black Magic Debug port"
     config NETWORK_PROBE_SWCLK_GPIO
         int "SWCLK GPIO"
         range 0 31
-        default 12
+        default 5
         help
-            GPIO driving SWCLK. Must be below 32. The default GPIO12 is header pin GP1
-            (physical pin 2) on the Waveshare ESP32-S3-Pico, and is also the FSPICLK
-            IO_MUX pin, which keeps an SPI-based SWD implementation possible later.
+            GPIO driving SWCLK. Must be below 32, because the line is enabled through
+            GPIO_ENABLE_W1TS/W1TC.
 
     config NETWORK_PROBE_SWDIO_GPIO
         int "SWDIO GPIO"
         range 0 31
-        default 11
+        default 4
         help
             GPIO for SWDIO. Must be below 32, because the line direction is switched
-            through GPIO_ENABLE_W1TS/W1TC. The default GPIO11 is header pin GP0
-            (physical pin 1) on the Waveshare ESP32-S3-Pico, and is also the FSPID
-            IO_MUX pin.
+            through GPIO_ENABLE_W1TS/W1TC.
 
     config NETWORK_PROBE_NRST_GPIO
         int "Target nRST GPIO (-1 = not connected)"
         range -1 48
-        default 14
+        default 10
         help
-            Open-drain output with internal pull-up. The default GPIO14 is header pin GP3
-            (physical pin 5) on the Waveshare ESP32-S3-Pico. GPIO13 (GP2) is left free
-            on purpose: it is the FSPIQ IO_MUX pin.
+            Open-drain output with internal pull-up.
 
     config NETWORK_PROBE_SWD_FREQ_HZ
         int "Default SWD clock frequency (Hz)"

@@ -15,7 +15,7 @@
 
 #define PLATFORM_IDENT "(NETWORK PROBE ESP32-S3) "
 
-/* No status LEDs yet */
+/* The status LED belongs to the application (App/StatusLed), BMD's LED states are not shown */
 #define SET_RUN_STATE(state) \
 	do                       \
 	{                        \
