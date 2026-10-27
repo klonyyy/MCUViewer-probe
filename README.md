@@ -1,19 +1,24 @@
-# NETWORK PROBE
+# Wireless probe
 
-Wireless SWD probe on the ESP32-S3 for [MCUViewer](https://github.com/klonyyy/MCUViewer).
-It is built on [Black Magic Debug](https://codeberg.org/blackmagic-debug/blackmagic) (BMD).
+Wireless ESP32-S3 port of [Black Magic Debug Probe](https://codeberg.org/blackmagic-debug/blackmagic) optimized for high speed RAM readout for [MCUViewer](https://mcuviewer.com).
+
+## Why 
+
+I was fed up with the need to connect STLink with USB cable to the mobile robot I'm working on. It should be suitable for all other projects such as drones, power electronics circuits, basically wherever having a cable is problematic. Best part - it's very fast and flashing works out of the box with GDB server.
+
+<img src="wireless-probe.jpg" alt="Wireless probe" width="400">
+
 
 The probe serves two kinds of clients, one session at a time:
 
 - **MCUViewer** over the NETWORK PROBE protocol (TCP port 2023). The probe connects to the
-  target without halting it and reads and writes memory while it runs. In HSS mode it samples
-  on its own, with its own timestamps, and streams the samples. It also receives the target's
+  target without halting it and reads and writes memory while it runs. It also receives the target's
   SWO pin and streams the trace bytes.
 - **GDB**: BMD's GDB server over Wi-Fi (TCP port 2022). Use it for flashing and validation.
 
 ## Hardware
 
-Reference board: Waveshare ESP32-S3-Pico. The defaults below can be changed in menuconfig
+Reference board: Waveshare ESP32-S3-Mini. The defaults below can be changed in menuconfig
 under *NETWORK PROBE SWD / Black Magic Debug port* and *NETWORK PROBE SWO*.
 
 | Signal | GPIO |
@@ -24,7 +29,9 @@ under *NETWORK PROBE SWD / Black Magic Debug port* and *NETWORK PROBE SWO*.
 | nRST (optional, open-drain) | 10 |
 | GND | any GND pin |
 
-The target must run at 3.3 V and share ground with the probe.
+Note: the probe is powered from your target - make sure additional power draw is acceptable in your project. 
+
+The target must run at 3.3 V and share ground with the probe. For the future a small add-on board is planned with level translator ICs. 
 
 ### Status LED
 
@@ -56,18 +63,6 @@ idf.py build
 idf.py -p <PORT> flash monitor
 ```
 
-For development, a default network can be built in. Wi-Fi credentials never go into tracked
-files: create `sdkconfig.local` in the repository root. It is git-ignored:
-
-```
-CONFIG_NETWORK_PROBE_WIFI_SSID="my-network"
-CONFIG_NETWORK_PROBE_WIFI_PASSWORD="my-password"
-```
-
-It is applied as an extra defaults file. Defaults only fill options that are missing from
-`sdkconfig`, so after changing it, or `sdkconfig.defaults`, delete `sdkconfig` (or use
-`idf.py menuconfig`). The default network applies until a network is saved on the setup page.
-
 ## Connecting the probe to Wi-Fi
 
 The probe joins the network saved on it. Out of the box no network is saved, so it starts in
@@ -96,7 +91,7 @@ starts the ESP32-S3's download mode.
 The setup access point is open unless `CONFIG_NETWORK_PROBE_AP_PASSWORD` is set (at least 8
 characters).
 
-## Using MCUViewer
+## Using MCUViewer (from v1.4.0)
 
 In the acquisition settings pick the debug probe **NETWORK_PROBE** and enter:
 
@@ -104,8 +99,6 @@ In the acquisition settings pick the debug probe **NETWORK_PROBE** and enter:
   address shown on the setup page or in the boot log;
 - **Port**: `2023` (the field is shared with the GDB server probe, whose default is 3333);
 - **SWD speed**: up to 8000 kHz is verified with a logic analyzer, faster clocks are not yet;
-- **Mode**: **HSS**. NORMAL works too, but every sampling tick costs a network round trip, which
-  limits it to about 100–300 Hz over Wi-Fi.
 
 The probe serves one client at a time. While MCUViewer is connected, GDB connections are
 refused; while GDB is connected, MCUViewer gets no answer until the GDB session ends. A second
@@ -134,24 +127,6 @@ gdb-multiarch firmware.elf
 (gdb) monitor frequency 8M  # change the SWD clock
 ```
 
-## Repository layout
-
-The repository root is the ESP-IDF project (esp32s3). Its own components are registered in
-`CMakeLists.txt` instead of IDF's usual `main/` and `components/`.
-
-```
-App/                  probe application: Wi-Fi and mDNS, setup mode with the setup page
-                      (SetupPortal) and the saved network (NetworkSettings), the net task
-                      (NetServer), the SWD owner task with the GDB server, requests and
-                      streaming (ProbeService), light connect (TargetLink), the SWO receiver
-                      (SwoCapture), the status LED (StatusLed) and the protocol header shared
-                      with MCUViewer
-Platform/             BMD's ESP32-S3 platform port (SWD tap, GDB over TCP); builds BMD from
-                      External/blackmagic
-External/blackmagic/  Black Magic Debug v2.1.0 (git submodule, pinned)
-Tools/                host-side test scripts (Python 3, standard library only)
-```
-
 ## Timing test
 
 `Tools/read_timing.py` measures a probe over the NETWORK PROBE protocol: the network round trip,
@@ -165,21 +140,6 @@ python Tools/read_timing.py 192.168.1.19 --clock 4000,8000 --flash 0x08000000
 python Tools/read_timing.py --help
 ```
 
-## Development
-
-The firmware is C++ (IDF's default, `gnu++26`): one class per module in PascalCase files,
-formatted with the root `.clang-format`. BMD is C: each file includes the BMD headers it needs
-in one `extern "C"` block, and the functions BMD calls keep their C names. Only
-`Platform/platform.h`, which BMD's own sources include, and the `Platform/libc_compat` shim
-stay C.
-
-For clangd, `.clangd` points at `build/compile_commands.json`. clangd needs
-`--query-driver=**/xtensa-esp*-elf-*` to find the toolchain headers, which
-`.vscode/settings.json` sets.
-
 ## Licensing
 
-The firmware is GPL-3.0-or-later (see `COPYING`), because it links Black Magic Debug.
-
-`App/NetworkProbeProto.hpp`, the protocol header shared with MCUViewer, is MIT. It must not
-contain code derived from BMD.
+The firmware is GPL-3.0-or-later (see `COPYING`), as it links Black Magic Debug.
