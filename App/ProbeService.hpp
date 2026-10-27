@@ -19,7 +19,8 @@
  * HostLink, and runs the streaming loop, which samples the plan and fills the ring.
  *
  * While streaming, the loop polls HostLink between samples and executes requests there, so a READ or WRITE delays the
- * next sample instead of running in parallel with the plan.
+ * next sample instead of running in parallel with the plan. A READ_BULK takes the samples that come due between its
+ * 1 KiB pages.
  */
 class ProbeService
 {
@@ -59,6 +60,7 @@ class ProbeService
 	NetworkProbe::Status handleRead(const uint8_t* payload, uint16_t length, uint16_t& dataLength);
 	NetworkProbe::Status handleWrite(const uint8_t* payload, uint16_t length, uint16_t& dataLength);
 	NetworkProbe::Status handleReadList(const uint8_t* payload, uint16_t length, uint16_t& dataLength);
+	NetworkProbe::Status handleReadBulk(const uint8_t* payload, uint16_t length, uint16_t& dataLength);
 	NetworkProbe::Status handleReset(uint16_t length, uint16_t& dataLength);
 	NetworkProbe::Status handleGetStatus(uint16_t length, uint16_t& dataLength);
 	NetworkProbe::Status handleSetPlan(const uint8_t* payload, uint16_t length);
@@ -71,9 +73,20 @@ class ProbeService
 	NetworkProbe::Status targetFailure(uint16_t& dataLength);
 
 	/**
+	 * @brief Waits until the net task has taken a chunk of the READ_BULK answer, sampling meanwhile while streaming.
+	 * @return The chunk to fill next, or nullptr when the session ended.
+	 */
+	HostLink::BulkChunk* nextBulkChunk();
+
+	/**
 	 * @brief The sampling loop, until streaming stops.
 	 */
 	void stream();
+
+	/**
+	 * @brief Takes the next sample if its time has come.
+	 */
+	void sampleIfDue();
 
 	/**
 	 * @brief Takes one sample into the ring.

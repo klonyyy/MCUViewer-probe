@@ -23,6 +23,9 @@
  * Requests: one at a time. The net task copies a request in and sets slotState to request; the SWD owner task writes
  * the response and sets it to response; the net task sends it and sets it back to empty.
  *
+ * READ_BULK: the SWD owner task fills bulkChunks while the net task sends the filled ones as READ_DATA, so reading and
+ * sending overlap. The response follows the last chunk.
+ *
  * Sessions: sessionGeneration counts the ended client sessions. When it changed, the SWD owner task stops streaming and
  * releases the target before it handles anything else, and samples of an older session are never sent.
  */
@@ -33,6 +36,18 @@ struct HostLink
 	static constexpr uint8_t maxList = 255;			  /**< READ_LIST entries: count is a u8. */
 	static constexpr uint8_t maxBlocks = 128;		  /**< SET_PLAN blocks. */
 	static constexpr uint16_t maxSampleBytes = 1024;  /**< Sample record, t included. */
+	static constexpr uint16_t bulkChunkSize = maxRead; /**< READ_DATA bytes per frame. */
+	static constexpr uint32_t bulkSlots = 2;		   /**< One chunk is read while the other is sent. */
+
+	/**
+	 * @brief A part of a READ_BULK answer.
+	 */
+	struct BulkChunk
+	{
+		uint32_t offset; /**< Of the first byte in the READ_BULK. */
+		uint16_t length;
+		uint8_t data[bulkChunkSize];
+	};
 
 	enum class SlotState : uint8_t
 	{
@@ -66,6 +81,11 @@ struct HostLink
 	std::atomic<uint32_t> droppedSamples{0};   /**< Since START: the ring was full. */
 	std::atomic<uint32_t> sampleErrors{0};	   /**< Since START: the target access failed. */
 	std::atomic<uint32_t> targetLostCount{0};  /**< +1 when streaming stopped after too many failed samples in a row. */
+
+	/* READ_BULK answer, SWD owner task to net task; the counters run on, so written - sent chunks are waiting */
+	BulkChunk bulkChunks[bulkSlots];
+	std::atomic<uint32_t> bulkWritten{0}; /**< SWD owner task: chunks filled. */
+	std::atomic<uint32_t> bulkSent{0};	  /**< Net task: chunks sent or dropped. */
 
 	/* Samples, SWD owner task to net task */
 	SampleRing ring;

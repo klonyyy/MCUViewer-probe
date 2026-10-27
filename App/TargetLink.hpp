@@ -67,7 +67,8 @@ class TargetLink
 	static bool isConnected();
 
 	/**
-	 * @brief Reads target memory with the widest access of 4, 2 or 1 bytes that divides both address and length.
+	 * @brief Reads target memory with the widest access of 4, 2 or 1 bytes that divides both address and length. The
+	 * accesses are pipelined: one SWD transaction each, plus a few per 1 KiB page.
 	 * @return True on success, else see getError() and getFault().
 	 */
 	static bool read(uint32_t address, void* data, size_t length);
@@ -89,8 +90,9 @@ class TargetLink
 	};
 
 	/**
-	 * @brief Reads one sample of a plan: every block with exactly its access size, the data packed in block order. The
-	 * blocks have to be aligned to their access size and must not cross a 1 KiB boundary.
+	 * @brief Reads blocks, for example one sample of a plan: every block with exactly its access size, pipelined like
+	 * read(), the data packed in block order. The blocks have to be aligned to their access size and must not cross a
+	 * 1 KiB boundary.
 	 * @return True on success, else see getFault(); the data is then incomplete.
 	 */
 	static bool readBlocks(const Block* blocks, size_t count, uint8_t* data);

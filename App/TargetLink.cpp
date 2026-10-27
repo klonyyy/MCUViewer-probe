@@ -13,6 +13,8 @@
 
 #include "TargetLink.hpp"
 
+#include <algorithm>
+
 #include "esp_log.h"
 #include "sdkconfig.h"
 
@@ -32,8 +34,11 @@ constexpr const char* tag = "target_link";
 
 constexpr uint32_t powerUpTimeoutMs = 250;
 constexpr uint32_t resetTimeoutMs = 1000;
+constexpr uint32_t waitTimeoutMs = 250; /**< How long an access may answer WAIT, as in BMD. */
+constexpr uint8_t faultParity = 1;
 constexpr uint8_t faultSticky = 8;
 constexpr uint8_t faultOther = 255;
+constexpr uint64_t autoIncrementPage = 0x400; /**< TAR auto-increment only carries within 1 KiB. */
 
 constexpr uint32_t abortAll = ADIV5_DP_ABORT_ORUNERRCLR | ADIV5_DP_ABORT_WDERRCLR | ADIV5_DP_ABORT_STKERRCLR | ADIV5_DP_ABORT_STKCMPCLR;
 constexpr uint32_t powerUpRequest = ADIV5_DP_CTRLSTAT_CSYSPWRUPREQ | ADIV5_DP_CTRLSTAT_CDBGPWRUPREQ;
@@ -207,9 +212,123 @@ bool lightConnect(const uint8_t apSel, TargetLink::ConnectInfo& info)
 	return true;
 }
 
+/*
+ * One SWD transaction without the retries of adiv5_swd_raw_access(): that one answers a FAULT by clearing the sticky
+ * error and repeating the access, which in a pipelined read hides the failed access before it. WAIT is retried for
+ * waitTimeoutMs. No idle clocks follow, so the next transaction starts at once. A failure sets dp.fault to the ACK, or
+ * to faultParity.
+ */
+bool transfer(const uint8_t request, const bool read, uint32_t& value)
+{
+	platform_timeout_s timeout;
+	bool waiting = false;
+	while (true)
+	{
+		swd_proc.seq_out(request, 8U);
+		const uint8_t ack = swd_proc.seq_in(3U);
+		if (ack == SWD_ACK_OK)
+		{
+			if (!read)
+			{
+				swd_proc.seq_out_parity(value, 32U);
+				return true;
+			}
+			if (swd_proc.seq_in_parity(&value, 32U))
+				return true;
+			dp.fault = faultParity;
+			return false;
+		}
+		if (ack == SWD_ACK_WAIT)
+		{
+			if (!waiting)
+			{
+				platform_timeout_set(&timeout, waitTimeoutMs);
+				waiting = true;
+				continue;
+			}
+			if (!platform_timeout_is_expired(&timeout))
+				continue;
+			/* The AP is stuck in the access */
+			adiv5_dp_abort(&dp, ADIV5_DP_ABORT_DAPABORT);
+		}
+		dp.fault = ack;
+		return false;
+	}
+}
+
+bool writeRegister(const uint16_t address, uint32_t value)
+{
+	return transfer(make_packet_request(ADIV5_LOW_WRITE, address), false, value);
+}
+
+/* Selects bank 0 of the AP, then programs CSW for sequential accesses of the given width and TAR, as
+   adi_ap_mem_access_setup() does */
+bool setupAccess(const uint32_t address, const align_e align)
+{
+	uint32_t csw = ap.csw | ADIV5_AP_CSW_ADDRINC_SINGLE;
+	if (align == ALIGN_8BIT)
+		csw |= ADIV5_AP_CSW_SIZE_BYTE;
+	else if (align == ALIGN_16BIT)
+		csw |= ADIV5_AP_CSW_SIZE_HALFWORD;
+	else
+		csw |= ADIV5_AP_CSW_SIZE_WORD;
+
+	if (!writeRegister(ADIV5_DP_SELECT, static_cast<uint32_t>(ap.apsel) << 24U) || !writeRegister(ADIV5_AP_CSW, csw))
+		return false;
+	if ((ap.flags & ADIV5_AP_FLAGS_64BIT) && !writeRegister(ADIV5_AP_TAR_HIGH, 0U))
+		return false;
+	return writeRegister(ADIV5_AP_TAR_LOW, address);
+}
+
+/*
+ * Reads count accesses through DRW with the AP set up for them, pipelined: an AP read returns the result of the one
+ * before it, so the reads follow each other and RDBUFF returns the last one. The accesses must stay inside one 1 KiB
+ * auto-increment page. Returns the end of the data, or nullptr when a transaction failed.
+ */
+uint8_t* readPipelined(uint32_t address, const uint32_t count, const align_e align, uint8_t* data)
+{
+	const uint8_t drwRead = make_packet_request(ADIV5_LOW_READ, ADIV5_AP_DRW);
+	const uint32_t stride = 1U << align;
+	uint32_t value = 0;
+
+	if (!transfer(drwRead, true, value))
+		return nullptr;
+	for (uint32_t access = 1; access < count; ++access, address += stride)
+	{
+		if (!transfer(drwRead, true, value))
+			return nullptr;
+		data = static_cast<uint8_t*>(adiv5_unpack_data(data, address, value, align));
+	}
+	if (!transfer(make_packet_request(ADIV5_LOW_READ, ADIV5_DP_RDBUFF), true, value))
+		return nullptr;
+	data = static_cast<uint8_t*>(adiv5_unpack_data(data, address, value, align));
+
+	/* Idle clocks complete the last transaction */
+	swd_proc.seq_out(0U, 8U);
+	return data;
+}
+
 bool readMemory(const uint32_t address, void* const data, const size_t length)
 {
-	adiv5_mem_read(&ap, data, address, length);
+	if (length == 0)
+		return true;
+
+	const align_e align = MIN_ALIGN(address, length);
+	const uint64_t end = static_cast<uint64_t>(address) + length;
+	uint8_t* out = static_cast<uint8_t*>(data);
+
+	if (setupAccess(address, align))
+	{
+		/* TAR is written again at every page, as auto-increment does not carry past it */
+		for (uint64_t page = address; page < end && out;)
+		{
+			const uint64_t pageEnd = std::min(end, (page | (autoIncrementPage - 1U)) + 1U);
+			if (page != address && !writeRegister(ADIV5_AP_TAR_LOW, static_cast<uint32_t>(page)))
+				break;
+			out = readPipelined(static_cast<uint32_t>(page), static_cast<uint32_t>((pageEnd - page) >> align), align, out);
+			page = pageEnd;
+		}
+	}
 	return checkAccess();
 }
 
@@ -220,31 +339,22 @@ bool writeMemory(const uint32_t address, const void* const data, const size_t le
 }
 
 /*
- * Like adiv5_mem_read_bytes(), but with the access width given instead of derived from address and length, so a
- * block of 16-bit registers stays 16-bit accesses. No TAR reload: blocks do not cross the 1 KiB auto-increment
- * boundary. A fault leaves dp.fault set, and the AP reads after it return 0 without bus traffic.
+ * With the access width given instead of derived from address and length, so a block of 16-bit registers stays
+ * 16-bit accesses. No TAR reload: blocks do not cross the 1 KiB auto-increment boundary. CSW is only written again when
+ * the width changes, so most blocks only write TAR. Stops at the first failed transaction.
  */
 bool readPlanBlocks(const TargetLink::Block* const blocks, const size_t count, uint8_t* data)
 {
-	for (size_t i = 0; i < count; ++i)
+	align_e setUpAlign = ALIGN_32BIT;
+	for (size_t i = 0; i < count && data; ++i)
 	{
 		const TargetLink::Block& block = blocks[i];
 		const align_e align = block.accessSize == 4 ? ALIGN_32BIT : (block.accessSize == 2 ? ALIGN_16BIT : ALIGN_8BIT);
-		adi_ap_mem_access_setup(&ap, block.address, align);
-		for (uint32_t access = 0; access < block.count; ++access)
-		{
-			const uint32_t value = adiv5_dp_read(&dp, ADIV5_AP_DRW);
-			data = static_cast<uint8_t*>(adiv5_unpack_data(data, block.address + access * block.accessSize, value, align));
-		}
+		const bool ready = (i > 0 && align == setUpAlign) ? writeRegister(ADIV5_AP_TAR_LOW, block.address) : setupAccess(block.address, align);
+		setUpAlign = align;
+		data = ready ? readPipelined(block.address, block.count, align, data) : nullptr;
 	}
-
-	if (dp.fault)
-	{
-		const uint8_t fault = dp.fault;
-		adiv5_dp_error(&dp);
-		return fail(TargetLink::Error::swd, fault);
-	}
-	return true;
+	return checkAccess();
 }
 
 /* AIRCR.SYSRESETREQ: the access itself can fail as the reset takes effect, which is expected */

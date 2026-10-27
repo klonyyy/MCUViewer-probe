@@ -43,10 +43,12 @@ enum class Type : uint8_t
 	STOP = 0x12,
 	SWO_START = 0x13,
 	SWO_STOP = 0x14,
+	READ_BULK = 0x15, /* answered with READ_DATA frames, then the RESP */
 	RESP = 0x80,
 	DATA = 0x81,
 	EVENT = 0x82,
 	SWO_DATA = 0x83,
+	READ_DATA = 0x84, /* part of a READ_BULK answer, with the seq of the request */
 };
 
 enum class Status : uint8_t
@@ -77,6 +79,7 @@ constexpr uint32_t capReset = 1UL << 1;
 constexpr uint32_t capStream = 1UL << 2;
 constexpr uint32_t capCyccnt = 1UL << 3;
 constexpr uint32_t capSwo = 1UL << 4;
+constexpr uint32_t capReadBulk = 1UL << 5;
 
 /* GET_STATUS link state */
 enum class Link : uint8_t
@@ -131,7 +134,16 @@ constexpr size_t sampleTimeSize = 4;            /* u32 t at the start of every s
 constexpr size_t swoStartRequestSize = 6;       /* u32 baud, u8 encoding, u8 flags */
 constexpr size_t swoStartResponseSize = 4;      /* u32 baud */
 constexpr size_t swoDataHeaderSize = 4;         /* u32 first_byte, then the bytes */
+constexpr size_t readBulkRequestSize = 8;       /* u32 address, u32 length */
+constexpr size_t readDataHeaderSize = 4;        /* u32 offset of the first byte in the READ_BULK, then the bytes */
+constexpr uint32_t readBulkMaxLength = 1UL << 24;
 constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a multiple of 1 KiB */
+
+/*
+ * READ_BULK reads length bytes from address with the widest access of 4, 2 or 1 bytes that divides both, like READ.
+ * The probe sends the bytes in order, in READ_DATA frames of at most max_payload, then the RESP: OK without data once
+ * every byte went out, or TARGET_ERROR when an access failed, after the READ_DATA of the bytes read before it.
+ */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */
 struct FrameHeader

@@ -19,9 +19,9 @@
  * @brief The net task, on core 0: the network side of the NETWORK PROBE protocol.
  *
  * It serves one client at a time on the protocol port; a new connection takes over the old one. It answers HELLO
- * itself, hands every other request to the SWD owner task through HostLink, and sends the answers. It drains the
- * sample ring into DATA frames and reports EVENTs. Answers go out before samples, and the socket never blocks the
- * task, so a full TCP window only fills the ring.
+ * itself, hands every other request to the SWD owner task through HostLink, and sends the answers, a READ_BULK answer
+ * as READ_DATA frames while the SWD owner task reads on. It drains the sample ring into DATA frames and reports EVENTs.
+ * Answers go out before samples, and the socket never blocks the task, so a full TCP window only fills the ring.
  *
  * SWO needs no SWD, so the net task owns the SWO capture: it answers SWO_START and SWO_STOP itself, and sends the
  * captured bytes in SWO_DATA frames, taking turns with DATA.
@@ -115,6 +115,12 @@ class NetServer
 	 * @return False when nothing is to be sent.
 	 */
 	bool nextFrame(int64_t now);
+
+	/**
+	 * @brief Puts the oldest filled chunk of the READ_BULK answer into a READ_DATA frame and frees it.
+	 * @return False when no chunk is waiting.
+	 */
+	bool buildBulkData();
 
 	bool buildData(int64_t now);
 	bool buildSwoData(int64_t now);

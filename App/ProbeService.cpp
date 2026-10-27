@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+#include <algorithm>
+
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -103,6 +105,9 @@ void ProbeService::handleRequest()
 			break;
 		case NetworkProbe::Type::READ_LIST:
 			status = handleReadList(payload, length, dataLength);
+			break;
+		case NetworkProbe::Type::READ_BULK:
+			status = handleReadBulk(payload, length, dataLength);
 			break;
 		case NetworkProbe::Type::RESET:
 			status = handleReset(length, dataLength);
@@ -217,6 +222,48 @@ NetworkProbe::Status ProbeService::handleReadList(const uint8_t* const payload, 
 		out += 1U + size;
 	}
 	dataLength = static_cast<uint16_t>(out - link->responseData);
+	return NetworkProbe::Status::OK;
+}
+
+NetworkProbe::Status ProbeService::handleReadBulk(const uint8_t* const payload, const uint16_t length, uint16_t& dataLength)
+{
+	if (length != NetworkProbe::readBulkRequestSize)
+		return NetworkProbe::Status::MALFORMED;
+	const uint32_t address = NetworkProbe::getU32(payload);
+	const uint32_t total = NetworkProbe::getU32(payload + 4);
+	if (total == 0 || total > NetworkProbe::readBulkMaxLength || static_cast<uint64_t>(address) + total > (1ULL << 32U))
+		return NetworkProbe::Status::MALFORMED;
+	if (!TargetLink::isConnected())
+		return NetworkProbe::Status::NOT_CONNECTED;
+
+	/* The width that divides address and length, kept on every page */
+	const uint8_t accessSize = ((address | total) & 3U) == 0 ? 4U : (((address | total) & 1U) == 0 ? 2U : 1U);
+
+	for (uint32_t offset = 0; offset < total;)
+	{
+		HostLink::BulkChunk* const chunk = nextBulkChunk();
+		if (!chunk)
+			return NetworkProbe::Status::NOT_CONNECTED;
+
+		const uint32_t chunkLength = std::min<uint32_t>(HostLink::bulkChunkSize, total - offset);
+		for (uint32_t filled = 0; filled < chunkLength;)
+		{
+			const uint32_t pageAddress = address + offset + filled;
+			const uint32_t pageLength = std::min<uint32_t>(chunkLength - filled, NetworkProbe::blockBoundary - (pageAddress & (NetworkProbe::blockBoundary - 1U)));
+			const TargetLink::Block page = {pageAddress, static_cast<uint16_t>(pageLength / accessSize), accessSize};
+			if (!TargetLink::readBlocks(&page, 1, chunk->data + filled))
+				return targetFailure(dataLength);
+			filled += pageLength;
+			if (streaming)
+				sampleIfDue();
+		}
+
+		chunk->offset = offset;
+		chunk->length = static_cast<uint16_t>(chunkLength);
+		link->bulkWritten.store(link->bulkWritten.load(std::memory_order_relaxed) + 1U, std::memory_order_release);
+		link->wakeNet();
+		offset += chunkLength;
+	}
 	return NetworkProbe::Status::OK;
 }
 
@@ -354,6 +401,22 @@ bool ProbeService::quiesceRing()
 	return true;
 }
 
+HostLink::BulkChunk* ProbeService::nextBulkChunk()
+{
+	const uint32_t written = link->bulkWritten.load(std::memory_order_relaxed);
+	while (written - link->bulkSent.load(std::memory_order_acquire) >= HostLink::bulkSlots)
+	{
+		if (checkSession())
+			return nullptr;
+		/* The net task wakes this task when it took a chunk */
+		if (streaming)
+			sampleIfDue();
+		else
+			ulTaskNotifyTake(pdTRUE, 1);
+	}
+	return &link->bulkChunks[written % HostLink::bulkSlots];
+}
+
 void ProbeService::stream()
 {
 	while (streaming)
@@ -369,18 +432,22 @@ void ProbeService::stream()
 			handleRequest();
 			continue;
 		}
-
-		const int64_t now = esp_timer_get_time();
-		if (now < nextTime)
-			continue;
-
-		takeSample(static_cast<uint32_t>(now - startTime));
-
-		/* Behind by a period or more: take the next sample at once, but do not catch up with a burst */
-		nextTime += periodUs;
-		if (nextTime <= now)
-			nextTime = now;
+		sampleIfDue();
 	}
+}
+
+void ProbeService::sampleIfDue()
+{
+	const int64_t now = esp_timer_get_time();
+	if (now < nextTime)
+		return;
+
+	takeSample(static_cast<uint32_t>(now - startTime));
+
+	/* Behind by a period or more: take the next sample at once, but do not catch up with a burst */
+	nextTime += periodUs;
+	if (nextTime <= now)
+		nextTime = now;
 }
 
 void ProbeService::takeSample(const uint32_t time)

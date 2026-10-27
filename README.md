@@ -128,6 +128,20 @@ App/                  probe application: Wi-Fi and mDNS, setup mode with the set
 Platform/             BMD's ESP32-S3 platform port (SWD tap, GDB over TCP); builds BMD from
                       External/blackmagic
 External/blackmagic/  Black Magic Debug v2.1.0 (git submodule, pinned)
+Tools/                host-side test scripts (Python 3, standard library only)
+```
+
+## Timing test
+
+`Tools/read_timing.py` measures a probe over the NETWORK PROBE protocol: the network round trip,
+READ and READ_BULK throughput, a recorder-sized buffer read the way MCUViewer does it, and the HSS
+sampling rate. With `--flash` it also compares READ and READ_BULK byte for byte, with 32-, 16- and
+8-bit accesses; `--dump` and `--compare` keep a reference taken with another firmware. It only
+reads, the target keeps running, and it leaves a probe alone that serves another session.
+
+```
+python Tools/read_timing.py 192.168.1.19 --clock 4000,8000 --flash 0x08000000
+python Tools/read_timing.py --help
 ```
 
 ## Development

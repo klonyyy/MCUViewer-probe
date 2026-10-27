@@ -62,6 +62,7 @@ void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCa
 	static_assert(NetworkProbe::helloResponseFixedSize + 3U * (1U + UINT8_MAX) + NetworkProbe::helloSwoSize <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a HELLO answer must fit");
 	static_assert(NetworkProbe::discoverResponseFixedSize + 3U * (1U + UINT8_MAX) <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a DISCOVER answer must fit");
 	static_assert(dataTargetPayload <= HostLink::maxPayload, "an SWO_DATA frame must fit");
+	static_assert(NetworkProbe::readDataHeaderSize + HostLink::bulkChunkSize <= HostLink::maxPayload, "a READ_DATA frame must fit");
 
 	link = &hostLink;
 	swo = &swoCapture;
@@ -332,6 +333,7 @@ bool NetServer::receive()
 		return false;
 	rxLength += static_cast<size_t>(received);
 
+	/* TCP is a byte stream: parse every complete frame in the buffer, keep a partial one for the next recv() */
 	size_t offset = 0;
 	while (rxLength - offset >= NetworkProbe::headerSize)
 	{
@@ -351,6 +353,7 @@ bool NetServer::receive()
 		const size_t frameSize = NetworkProbe::frameOverhead + header.length;
 		if (rxLength - offset < frameSize)
 			break;
+		/* The CRC covers header + payload and sits right after the payload */
 		if (NetworkProbe::getU32(frame + NetworkProbe::headerSize + header.length) != esp_rom_crc32_le(0, frame, NetworkProbe::headerSize + header.length))
 		{
 			ESP_LOGW(tag, "frame CRC mismatch, closing the connection");
@@ -385,6 +388,7 @@ bool NetServer::handleFrame(const NetworkProbe::FrameHeader& header, const uint8
 	if (header.type == NetworkProbe::Type::SWO_START || header.type == NetworkProbe::Type::SWO_STOP)
 		return handleSwoRequest(header, payload);
 
+	/* Hand the request to the SWD owner task through the single slot; the answer comes back in nextFrame() */
 	link->requestType = header.type;
 	link->requestSeq = header.seq;
 	link->requestLength = header.length;
@@ -443,7 +447,7 @@ uint16_t NetServer::buildHello(uint8_t* const data) const
 {
 	NetworkProbe::putU16(data, NetworkProbe::protocolVersion);
 	NetworkProbe::putU16(data + 2, HostLink::maxPayload);
-	NetworkProbe::putU32(data + 4, NetworkProbe::capSwd | NetworkProbe::capReset | NetworkProbe::capStream | (swo->isAvailable() ? NetworkProbe::capSwo : 0U));
+	NetworkProbe::putU32(data + 4, NetworkProbe::capSwd | NetworkProbe::capReset | NetworkProbe::capStream | NetworkProbe::capReadBulk | (swo->isAvailable() ? NetworkProbe::capSwo : 0U));
 	NetworkProbe::putU16(data + 8, HostLink::maxRead);
 	data[10] = HostLink::maxList;
 	data[11] = HostLink::maxBlocks;
@@ -479,12 +483,17 @@ void NetServer::serviceLink()
 		link->ringAck.store(ringRequest, std::memory_order_release);
 	}
 
-	/* An answer for a client that is gone */
-	if ((clientSocket < 0 || dropResponse) && link->slotState.load(std::memory_order_acquire) == HostLink::SlotState::response)
+	/* An answer for a client that is gone, and the READ_BULK chunks before it; once the answer is there, so are they */
+	if (clientSocket < 0 || dropResponse)
 	{
-		requestOutstanding = false;
-		dropResponse = false;
-		link->slotState.store(HostLink::SlotState::empty, std::memory_order_release);
+		const bool answered = link->slotState.load(std::memory_order_acquire) == HostLink::SlotState::response;
+		link->bulkSent.store(link->bulkWritten.load(std::memory_order_acquire), std::memory_order_release);
+		if (answered)
+		{
+			requestOutstanding = false;
+			dropResponse = false;
+			link->slotState.store(HostLink::SlotState::empty, std::memory_order_release);
+		}
 	}
 }
 
@@ -496,6 +505,7 @@ bool NetServer::pumpTx()
 		if (txSent == txLength && !nextFrame(now))
 			return true;
 
+		/* Partial sends are resumed from txSent; EAGAIN leaves the frame for the next select() round */
 		while (txSent < txLength)
 		{
 			const ssize_t sent = send(clientSocket, txFrame.data() + txSent, txLength - txSent, 0);
@@ -514,6 +524,7 @@ bool NetServer::pumpTx()
 
 bool NetServer::nextFrame(const int64_t now)
 {
+	/* Priority: own answer, SWD answer (after its READ_BULK chunks), events, then DATA / SWO_DATA */
 	txLength = 0;
 	txSent = 0;
 
@@ -525,16 +536,24 @@ bool NetServer::nextFrame(const int64_t now)
 		return true;
 	}
 
-	if (requestOutstanding && !dropResponse && link->slotState.load(std::memory_order_acquire) == HostLink::SlotState::response)
+	if (requestOutstanding && !dropResponse)
 	{
-		uint8_t* const frame = txFrame.data();
-		frame[NetworkProbe::headerSize] = NetworkProbe::toByte(link->requestType);
-		frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(link->responseStatus);
-		memcpy(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize, link->responseData, link->responseLength);
-		txLength = sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + link->responseLength, link->requestSeq);
-		requestOutstanding = false;
-		link->slotState.store(HostLink::SlotState::empty, std::memory_order_release);
-		return true;
+		/* Loaded before the chunks: once the answer is there, so are all READ_BULK chunks, which go out first */
+		const bool answered = link->slotState.load(std::memory_order_acquire) == HostLink::SlotState::response;
+		if (buildBulkData())
+			return true;
+		if (answered)
+		{
+			/* RESP payload: u8 request type, u8 status, then the data from the SWD owner task; seq is the request's */
+			uint8_t* const frame = txFrame.data();
+			frame[NetworkProbe::headerSize] = NetworkProbe::toByte(link->requestType);
+			frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(link->responseStatus);
+			memcpy(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize, link->responseData, link->responseLength);
+			txLength = sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + link->responseLength, link->requestSeq);
+			requestOutstanding = false;
+			link->slotState.store(HostLink::SlotState::empty, std::memory_order_release);
+			return true;
+		}
 	}
 
 	if (buildEvent(now) || buildSwoEvent(now))
@@ -543,6 +562,25 @@ bool NetServer::nextFrame(const int64_t now)
 	/* DATA and SWO_DATA take turns, so neither waits behind a backlog of the other */
 	swoTurn = !swoTurn;
 	return swoTurn ? (buildSwoData(now) || buildData(now)) : (buildData(now) || buildSwoData(now));
+}
+
+bool NetServer::buildBulkData()
+{
+	const uint32_t sent = link->bulkSent.load(std::memory_order_relaxed);
+	if (link->bulkWritten.load(std::memory_order_acquire) == sent)
+		return false;
+
+	/* READ_DATA payload: u32 offset in the READ_BULK, then the chunk bytes; seq is the request's */
+	const HostLink::BulkChunk& chunk = link->bulkChunks[sent % HostLink::bulkSlots];
+	uint8_t* const payload = txFrame.data() + NetworkProbe::headerSize;
+	NetworkProbe::putU32(payload, chunk.offset);
+	memcpy(payload + NetworkProbe::readDataHeaderSize, chunk.data, chunk.length);
+	txLength = sealFrame(txFrame.data(), NetworkProbe::Type::READ_DATA, static_cast<uint16_t>(NetworkProbe::readDataHeaderSize + chunk.length), link->requestSeq);
+
+	/* The chunk is copied out, so the SWD owner task can fill it again */
+	link->bulkSent.store(sent + 1U, std::memory_order_release);
+	link->wakeProbe();
+	return true;
 }
 
 bool NetServer::buildEvent(const int64_t now)
@@ -602,6 +640,7 @@ bool NetServer::buildSwoEvent(const int64_t now)
 
 void NetServer::buildEventFrame(const NetworkProbe::Event event, const uint32_t value)
 {
+	/* EVENT payload: u8 event code, u32 counter value (dropped samples, errors, ...) */
 	uint8_t* const payload = txFrame.data() + NetworkProbe::headerSize;
 	payload[0] = NetworkProbe::toByte(event);
 	NetworkProbe::putU32(payload + 1, value);
@@ -633,6 +672,7 @@ bool NetServer::buildData(const int64_t now)
 	while (count < std::min(available, frameSamples) && NetworkProbe::getU32(ring.peek(count)) == first + count)
 		count++;
 
+	/* DATA payload: u16 plan id, u32 first sample index, u16 count, u16 record size, then the records */
 	uint8_t* const payload = txFrame.data() + NetworkProbe::headerSize;
 	NetworkProbe::putU16(payload, link->streamPlanId.load(std::memory_order_relaxed));
 	NetworkProbe::putU32(payload + 2, first);
@@ -644,6 +684,7 @@ bool NetServer::buildData(const int64_t now)
 		memcpy(out, ring.peek(i) + 4U, record);
 		out += record;
 	}
+	/* Records are copied out, so the slots go back to the SWD owner task */
 	ring.release(count);
 
 	lastDataTime = now;
@@ -666,10 +707,12 @@ bool NetServer::buildSwoData(const int64_t now)
 	NetworkProbe::putU32(payload, first);
 
 	lastSwoDataTime = now;
+	/* SWO_DATA payload: u32 index of the first byte, then the raw SWO bytes */
 	txLength = sealFrame(txFrame.data(), NetworkProbe::Type::SWO_DATA, static_cast<uint16_t>(NetworkProbe::swoDataHeaderSize + length), frameSeq++);
 	return true;
 }
 
+/* Frame layout: [header][payload][CRC32 of header + payload]; returns the total size to send */
 size_t NetServer::sealFrame(uint8_t* const frame, const NetworkProbe::Type type, const uint16_t length, const uint16_t seq)
 {
 	NetworkProbe::encodeHeader(frame, type, length, seq);
