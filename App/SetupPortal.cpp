@@ -187,7 +187,9 @@ function showStatus(status) {
   } else if (status.state === "failed") {
     say("bad", "Could not connect to " + status.ssid + ": " + status.error + ".");
   } else if (status.saved) {
-    say("", "The saved network " + status.saved + " is out of reach. The probe tries it again every 30 seconds.");
+    say("", status.savedCount > 1
+        ? "None of the " + status.savedCount + " saved networks is in reach. The probe tries them again every 30 seconds."
+        : "The saved network " + status.saved + " is out of reach. The probe tries it again every 30 seconds.");
   } else {
     say("");
   }
@@ -474,6 +476,10 @@ esp_err_t SetupPortal::handleStatus(httpd_req_t* const request)
 	out = putJsonString(out, end, status.hostname);
 	out = putText(out, end, ",\"saved\":");
 	out = putJsonString(out, end, status.savedSsid);
+	out = putText(out, end, ",\"savedCount\":");
+	char count[8];
+	snprintf(count, sizeof(count), "%u", static_cast<unsigned>(status.savedCount));
+	out = putText(out, end, count);
 	out = putText(out, end, ",\"ip\":");
 	out = putJsonString(out, end, status.ip);
 	out = putText(out, end, ",\"error\":");

@@ -21,13 +21,14 @@
 #include "freertos/queue.h"
 
 /**
- * @brief Wi-Fi: the station on the saved network, setup mode, and the mDNS announcement.
+ * @brief Wi-Fi: the station on the saved networks, setup mode, and the mDNS announcement.
  *
- * At boot the probe joins the saved network (NetworkSettings). If none is saved, or it gives no IP address in time, the
- * probe enters setup mode: an access point named after the device id serves the setup page (SetupPortal), and the
- * station keeps trying the saved network in the background. A network chosen on the setup page is tried while the
- * access point stays up, saved once it gives an IP address, and the access point closes a minute later. On its network
- * the probe reconnects whenever the link drops.
+ * At boot the probe joins one of the saved networks (SavedNetworks): the strongest one in range, then the others by
+ * signal strength should it fail. If none is saved, or none gives an IP address in time, the probe enters setup mode:
+ * an access point named after the device id serves the setup page (SetupPortal), and the station keeps trying the
+ * saved networks in the background. A network chosen on the setup page is tried while the access point stays up, added
+ * to the saved ones once it gives an IP address, and the access point closes a minute later. On its network the probe
+ * reconnects whenever the link drops.
  *
  * The Wi-Fi task owns all of it: the Wi-Fi events and the setup page only queue commands for it, the setup button and
  * the timeouts are polled by it.
@@ -55,7 +56,8 @@ class Wifi
 		JoinState state = JoinState::idle;
 		char ssid[NetworkSettings::maxSsidLength + 1] = {};			/**< Network of the join. */
 		char hostname[NetworkSettings::maxHostnameLength + 1] = {}; /**< Hostname of the join, else the saved one. */
-		char savedSsid[NetworkSettings::maxSsidLength + 1] = {};
+		char savedSsid[NetworkSettings::maxSsidLength + 1] = {}; /**< The saved network joined last. */
+		uint8_t savedCount = 0;
 		char ip[16] = {};	 /**< Station address, empty without one. */
 		char error[96] = {}; /**< Why the join failed. */
 	};
@@ -70,7 +72,7 @@ class Wifi
 	static constexpr size_t maxNetworks = 20;
 
 	/**
-	 * @brief Brings up the network: joins the saved network, or enters setup mode if none is saved or it gave no IP
+	 * @brief Brings up the network: joins a saved network, or enters setup mode if none is saved or none gave an IP
 	 * address in time. Also starts mDNS. Blocks until the network is usable.
 	 */
 	void start();
@@ -168,9 +170,20 @@ class Wifi
 	void leaveSetup();
 
 	/**
-	 * @brief Starts connecting the station; a connection must not be under way.
+	 * @brief Starts connecting the station to a network; a connection must not be under way.
 	 */
 	void connectStation(const NetworkSettings& settings);
+
+	/**
+	 * @brief Starts connecting the station to the saved networks, in the order of their signal; a connection must not
+	 * be under way. A failed attempt goes on with the next one, see connectNextSaved().
+	 */
+	void connectSaved();
+
+	/**
+	 * @return False if every saved network of the current round was tried.
+	 */
+	bool connectNextSaved();
 	void applyHostname(const char* hostname);
 	void onDisconnected(uint32_t reason);
 	void onGotIp(uint32_t address);
@@ -194,8 +207,12 @@ class Wifi
 	char deviceId[NetworkSettings::deviceIdSize] = {};
 
 	/* Wi-Fi task */
-	NetworkSettings saved;	   /**< Joined at boot and retried in setup mode. */
+	SavedNetworks saved;	   /**< Joined at boot and retried in setup mode. */
 	NetworkSettings candidate; /**< What the join tries. */
+	NetworkSettings active;	   /**< What the station connects to, or is connected to. */
+	uint8_t order[SavedNetworks::maxCount] = {}; /**< Indexes into saved, in the order the current round tries them. */
+	size_t orderCount = 0;
+	size_t orderNext = 0;
 	bool wifiStarted = false;
 	bool setupMode = false;
 	bool staBusy = false;	/**< Connecting or connected: another connection needs a disconnection first. */

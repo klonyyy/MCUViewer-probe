@@ -67,7 +67,8 @@ void Wifi::start()
 	{
 		std::lock_guard<std::mutex> lock(statusLock);
 		strlcpy(status.hostname, saved.hostname, sizeof(status.hostname));
-		strlcpy(status.savedSsid, saved.ssid, sizeof(status.savedSsid));
+		strlcpy(status.savedSsid, saved.count ? saved.networks[0].ssid : "", sizeof(status.savedSsid));
+		status.savedCount = static_cast<uint8_t>(saved.count);
 	}
 	ESP_LOGI(tag, "device id %s", deviceId);
 
@@ -186,7 +187,7 @@ void Wifi::run()
 			enterSetup();
 		}
 		if (retryDeadline.due(now) && !staBusy && !joining)
-			connectStation(saved);
+			connectSaved();
 		if (joinDeadline.due(now) && joining)
 			onJoinTimeout();
 		if (closeDeadline.due(now) && hasIp)
@@ -205,7 +206,7 @@ void Wifi::handle(const Message& message)
 	{
 		case Command::staStart:
 			if (!setupMode && !staBusy)
-				connectStation(saved);
+				connectSaved();
 			break;
 		case Command::staConnected:
 			staLinked = true;
@@ -243,7 +244,7 @@ TickType_t Wifi::ticksUntilDeadline() const
 
 void Wifi::boot()
 {
-	if (!saved.ssid[0])
+	if (!saved.count)
 	{
 		ESP_LOGI(tag, "no network saved");
 		enterSetup();
@@ -294,7 +295,7 @@ void Wifi::enterSetup()
 	wifiStarted = true;
 
 	ESP_LOGI(tag, "setup mode: access point \"%s\"", deviceId);
-	if (saved.ssid[0])
+	if (saved.count)
 		retryDeadline.arm(setupRetryMs);
 }
 
@@ -312,6 +313,7 @@ void Wifi::leaveSetup()
 
 void Wifi::connectStation(const NetworkSettings& settings)
 {
+	active = settings;
 	applyHostname(settings.hostname);
 
 	wifi_config_t config = {};
@@ -334,6 +336,35 @@ void Wifi::connectStation(const NetworkSettings& settings)
 		retryDeadline.arm(setupMode ? setupRetryMs : reconnectDelayMs);
 }
 
+void Wifi::connectSaved()
+{
+	orderCount = 0;
+	orderNext = 0;
+	if (saved.count > 1)
+	{
+		scan();
+		/* The scan lists the networks strongest first, and so does the order */
+		std::lock_guard<std::mutex> lock(statusLock);
+		for (size_t n = 0; n < networkCount; ++n)
+			for (size_t i = 0; i < saved.count; ++i)
+				if (!strcmp(networks[n].ssid, saved.networks[i].ssid))
+					order[orderCount++] = static_cast<uint8_t>(i);
+	}
+	/* A single network, or none in sight: hidden networks do not show in a scan, so try them all */
+	if (!orderCount)
+		for (size_t i = 0; i < saved.count; ++i)
+			order[orderCount++] = static_cast<uint8_t>(i);
+	connectNextSaved();
+}
+
+bool Wifi::connectNextSaved()
+{
+	if (orderNext >= orderCount)
+		return false;
+	connectStation(saved.networks[order[orderNext++]]);
+	return true;
+}
+
 void Wifi::applyHostname(const char* const hostname)
 {
 	if (!strcmp(activeHostname, hostname))
@@ -350,6 +381,7 @@ void Wifi::applyHostname(const char* const hostname)
 
 void Wifi::onDisconnected(const uint32_t reason)
 {
+	const bool wasLinked = staLinked;
 	staBusy = false;
 	staLinked = false;
 	if (hasIp)
@@ -385,13 +417,19 @@ void Wifi::onDisconnected(const uint32_t reason)
 	if (!setupMode)
 	{
 		ESP_LOGW(tag, "disconnected (reason %lu), reconnecting", static_cast<unsigned long>(reason));
-		connectStation(saved);
+		/* A lost link starts over with the strongest network; a failed attempt goes on with the next one */
+		if (wasLinked || !connectNextSaved())
+			connectSaved();
 		return;
 	}
 
-	if (saved.ssid[0])
+	if (saved.count)
 	{
-		ESP_LOGI(tag, "\"%s\" not reachable (reason %lu), trying again in %lu s", saved.ssid, static_cast<unsigned long>(reason), static_cast<unsigned long>(setupRetryMs / 1000));
+		if (wasLinked)
+			orderNext = orderCount;
+		if (connectNextSaved())
+			return;
+		ESP_LOGI(tag, "no saved network reachable (reason %lu), trying again in %lu s", static_cast<unsigned long>(reason), static_cast<unsigned long>(setupRetryMs / 1000));
 		retryDeadline.arm(setupRetryMs);
 	}
 }
@@ -408,23 +446,27 @@ void Wifi::onGotIp(const uint32_t address)
 	{
 		joining = false;
 		joinDeadline.disarm();
-		saved = candidate;
+		saved.add(candidate);
+		/* The indexes of the round are stale now */
+		orderCount = 0;
+		orderNext = 0;
 		if (saved.save())
-			ESP_LOGI(tag, "network \"%s\" saved", saved.ssid);
+			ESP_LOGI(tag, "network \"%s\" saved", candidate.ssid);
 		else
-			ESP_LOGE(tag, "saving network \"%s\" failed", saved.ssid);
+			ESP_LOGE(tag, "saving network \"%s\" failed", candidate.ssid);
 	}
 
 	const esp_ip4_addr_t ip = {address};
 	char text[sizeof(Status::ip)];
 	snprintf(text, sizeof(text), IPSTR, IP2STR(&ip));
-	ESP_LOGI(tag, "station IP %s on \"%s\"", text, saved.ssid);
+	ESP_LOGI(tag, "station IP %s on \"%s\"", text, active.ssid);
 	{
 		std::lock_guard<std::mutex> lock(statusLock);
 		strlcpy(status.ip, text, sizeof(status.ip));
-		strlcpy(status.ssid, saved.ssid, sizeof(status.ssid));
+		strlcpy(status.ssid, active.ssid, sizeof(status.ssid));
 		strlcpy(status.hostname, saved.hostname, sizeof(status.hostname));
-		strlcpy(status.savedSsid, saved.ssid, sizeof(status.savedSsid));
+		strlcpy(status.savedSsid, saved.networks[0].ssid, sizeof(status.savedSsid));
+		status.savedCount = static_cast<uint8_t>(saved.count);
 		if (setupMode)
 		{
 			status.state = JoinState::connected;
@@ -449,6 +491,8 @@ void Wifi::onJoin()
 	ESP_LOGI(tag, "joining \"%s\" as %s.local", candidate.ssid, candidate.hostname);
 	joining = true;
 	joinAttempts = 0;
+	orderCount = 0;
+	orderNext = 0;
 	retryDeadline.disarm();
 	closeDeadline.disarm();
 	joinDeadline.arm(joinTimeoutMs);
@@ -487,10 +531,10 @@ void Wifi::finishJoin(const char* const error)
 	}
 
 	applyHostname(saved.hostname);
-	/* Once the station is free, setup mode tries the saved network again */
+	/* Once the station is free, setup mode tries the saved networks again */
 	if (staBusy)
 		esp_wifi_disconnect();
-	else if (saved.ssid[0])
+	else if (saved.count)
 		retryDeadline.arm(setupRetryMs);
 }
 
@@ -562,8 +606,8 @@ void Wifi::pollButton(const int64_t now)
 		buttonPressedAt = now;
 	else if (now - buttonPressedAt >= static_cast<int64_t>(buttonHoldMs) * 1000)
 	{
-		ESP_LOGW(tag, "setup button held: forgetting the saved network and restarting");
-		NetworkSettings::erase();
+		ESP_LOGW(tag, "setup button held: forgetting the saved networks and restarting");
+		SavedNetworks::erase();
 		esp_restart();
 	}
 	StatusLed::setButtonHold(buttonPressedAt ? buttonHoldMs - static_cast<uint32_t>((now - buttonPressedAt) / 1000) : 0);

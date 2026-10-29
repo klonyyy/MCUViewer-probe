@@ -67,7 +67,7 @@ idf.py -p <PORT> flash monitor
 
 ## Connecting the probe to Wi-Fi
 
-The probe joins the network saved on it. Out of the box no network is saved, so it starts in
+The probe joins one of the networks saved on it, up to five. Out of the box no network is saved, so it starts in AP mode.
 **setup mode**:
 
 1. It opens an access point named after its device id, `network-probe-xxxxxx`: the last
@@ -78,14 +78,19 @@ The probe joins the network saved on it. Out of the box no network is saved, so 
    id. Only 2.4 GHz networks work.
 4. The probe tries the network while its access point stays up, so the page shows the result:
    the address, or why it failed (for example a wrong password). Once connected, the probe
-   saves the network and closes the access point a minute later.
+   adds the network to the saved ones and closes the access point a minute later. Running the
+   setup again for another network adds it; a network saved already gets its password updated,
+   and with five saved, the one joined longest ago is forgotten. The hostname is shared by all.
 
-At every boot the probe joins the saved network. If it gets no IP address within 15 s, setup
-mode starts again, and the probe keeps trying the saved network every 30 s, so after a router
-outage it comes back by itself. While the access point is up, MCUViewer and GDB also work
+At every boot the probe scans and joins the strongest saved network in range; if that fails,
+it tries the others by signal strength. When the link drops, it starts over the same way, so
+moving the probe between, say, home and the lab needs no setup. If none gives an IP address
+within 15 s, setup mode starts again, and the probe keeps trying the saved networks every 30 s,
+so after a router outage it comes back by itself. Hidden networks do not show in a scan: they
+are tried in the order of saving when no saved network is in sight. While the access point is up, MCUViewer and GDB also work
 over it, at 192.168.4.1.
 
-To forget the saved network, hold the BOOT button (GPIO0, see
+To forget all saved networks, hold the BOOT button (GPIO0, see
 `CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO`) for 3 s while the probe runs. It restarts in setup
 mode, or joins the default network if one is built in. Do not hold BOOT while powering up: that
 starts the ESP32-S3's download mode.

@@ -9,8 +9,7 @@
 #include <stddef.h>
 
 /**
- * @brief The network the probe joins and its hostname, kept in NVS. Until a network is saved, the Kconfig defaults
- * apply; until a hostname is saved, the hostname is the device id.
+ * @brief One network the probe joins, and the hostname to use on it.
  */
 struct NetworkSettings
 {
@@ -24,7 +23,31 @@ struct NetworkSettings
 	char hostname[maxHostnameLength + 1] = {};
 
 	/**
-	 * @brief Loads the saved settings, or the Kconfig defaults if no network is saved.
+	 * @return Why the settings cannot be used, or nullptr if they can. The text is shown on the setup page.
+	 */
+	const char* validate() const;
+
+	/**
+	 * @brief The probe's own name: network-probe- and the last three bytes of the station MAC. It names the setup access
+	 * point, is the default hostname and the id in the HELLO answer.
+	 */
+	static void getDeviceId(char* id, size_t size);
+};
+
+/**
+ * @brief The networks the probe may join, most recently joined first, and its hostname, kept in NVS. Until a network
+ * is saved, the Kconfig default network applies; until a hostname is saved, the hostname is the device id.
+ */
+struct SavedNetworks
+{
+	static constexpr size_t maxCount = 5;
+
+	NetworkSettings networks[maxCount]; /**< Every entry carries the hostname. */
+	size_t count = 0;
+	char hostname[NetworkSettings::maxHostnameLength + 1] = {};
+
+	/**
+	 * @brief Loads the saved networks, or the Kconfig default network if none is saved.
 	 */
 	void load();
 
@@ -34,20 +57,19 @@ struct NetworkSettings
 	bool save() const;
 
 	/**
-	 * @return Why the settings cannot be used, or nullptr if they can. The text is shown on the setup page.
+	 * @brief Puts a network first, replacing the one with the same SSID or else the oldest one if the list is full, and
+	 * takes over its hostname. The Kconfig default network is dropped, as it was never saved.
+	 * @param settings Valid settings, see NetworkSettings::validate().
 	 */
-	const char* validate() const;
+	void add(const NetworkSettings& settings);
 
 	/**
-	 * @brief Forgets the saved settings: the Kconfig defaults apply again.
+	 * @brief Forgets the saved networks and the hostname: the Kconfig defaults apply again.
 	 */
 	static void erase();
 
-	/**
-	 * @brief The probe's own name: network-probe- and the last three bytes of the station MAC. It names the setup access
-	 * point, is the default hostname and the id in the HELLO answer.
-	 */
-	static void getDeviceId(char* id, size_t size);
+   private:
+	bool defaultOnly = false; /**< The only entry is the Kconfig default, not in NVS. */
 };
 
 #endif /* NETWORKSETTINGS_HPP */

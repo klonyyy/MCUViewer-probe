@@ -4,7 +4,7 @@ menu "NETWORK PROBE network"
         string "Default Wi-Fi SSID"
         default ""
         help
-            Network to join until one is saved on the setup page. Leave empty to start
+            Network to join until one is saved on the setup page; the first one saved replaces it. Leave empty to start
             in setup mode. Put real credentials in sdkconfig.local (git-ignored), not in
             sdkconfig.defaults.
 
@@ -39,7 +39,7 @@ menu "NETWORK PROBE network"
         default 0
         help
             Active low, with the internal pull-up. Holding it for 3 s while the probe
-            runs forgets the saved network and restarts the probe. The default GPIO0
+            runs forgets the saved networks and restarts the probe. The default GPIO0
             is the BOOT button of the Waveshare ESP32-S3-Pico.
 
     config NETWORK_PROBE_PORT

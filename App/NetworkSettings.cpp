@@ -28,6 +28,21 @@ bool getString(const nvs_handle_t handle, const char* const key, char* const out
 	return false;
 }
 
+constexpr size_t keySize = 16;
+
+/* The first network keeps the keys of the single-network firmware, so a probe keeps its network when updated */
+void slotKeys(const size_t slot, char* const ssidKey, char* const passwordKey)
+{
+	if (slot == 0)
+	{
+		strlcpy(ssidKey, "ssid", keySize);
+		strlcpy(passwordKey, "password", keySize);
+		return;
+	}
+	snprintf(ssidKey, keySize, "ssid%u", static_cast<unsigned>(slot));
+	snprintf(passwordKey, keySize, "password%u", static_cast<unsigned>(slot));
+}
+
 bool isHex(const char c)
 {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
@@ -39,39 +54,99 @@ bool isHostnameChar(const char c)
 }
 }  // namespace
 
-void NetworkSettings::load()
+void SavedNetworks::load()
 {
-	*this = NetworkSettings{};
+	*this = SavedNetworks{};
 
-	bool saved = false;
 	nvs_handle_t handle;
 	if (nvs_open(nvsNamespace, NVS_READONLY, &handle) == ESP_OK)
 	{
-		saved = getString(handle, "ssid", ssid, sizeof(ssid)) && ssid[0];
-		getString(handle, "password", password, sizeof(password));
+		for (; count < maxCount; ++count)
+		{
+			char ssidKey[keySize];
+			char passwordKey[keySize];
+			slotKeys(count, ssidKey, passwordKey);
+			NetworkSettings& network = networks[count];
+			if (!getString(handle, ssidKey, network.ssid, sizeof(network.ssid)) || !network.ssid[0])
+				break;
+			getString(handle, passwordKey, network.password, sizeof(network.password));
+		}
 		getString(handle, "hostname", hostname, sizeof(hostname));
 		nvs_close(handle);
 	}
-	if (!saved)
+	if (!count && CONFIG_NETWORK_PROBE_WIFI_SSID[0])
 	{
-		strlcpy(ssid, CONFIG_NETWORK_PROBE_WIFI_SSID, sizeof(ssid));
-		strlcpy(password, CONFIG_NETWORK_PROBE_WIFI_PASSWORD, sizeof(password));
+		strlcpy(networks[0].ssid, CONFIG_NETWORK_PROBE_WIFI_SSID, sizeof(networks[0].ssid));
+		strlcpy(networks[0].password, CONFIG_NETWORK_PROBE_WIFI_PASSWORD, sizeof(networks[0].password));
+		count = 1;
+		defaultOnly = true;
 	}
 	if (!hostname[0])
-		getDeviceId(hostname, sizeof(hostname));
+		NetworkSettings::getDeviceId(hostname, sizeof(hostname));
+	for (size_t i = 0; i < count; ++i)
+		strlcpy(networks[i].hostname, hostname, sizeof(networks[i].hostname));
 }
 
-bool NetworkSettings::save() const
+bool SavedNetworks::save() const
 {
 	nvs_handle_t handle;
 	if (nvs_open(nvsNamespace, NVS_READWRITE, &handle) != ESP_OK)
 		return false;
-	const bool written = nvs_set_str(handle, "ssid", ssid) == ESP_OK && nvs_set_str(handle, "password", password) == ESP_OK &&
-						 nvs_set_str(handle, "hostname", hostname) == ESP_OK && nvs_commit(handle) == ESP_OK;
+	bool written = nvs_set_str(handle, "hostname", hostname) == ESP_OK;
+	for (size_t i = 0; i < maxCount && written; ++i)
+	{
+		char ssidKey[keySize];
+		char passwordKey[keySize];
+		slotKeys(i, ssidKey, passwordKey);
+		if (i < count)
+			written = nvs_set_str(handle, ssidKey, networks[i].ssid) == ESP_OK && nvs_set_str(handle, passwordKey, networks[i].password) == ESP_OK;
+		else
+		{
+			const esp_err_t ssidResult = nvs_erase_key(handle, ssidKey);
+			const esp_err_t passwordResult = nvs_erase_key(handle, passwordKey);
+			written = (ssidResult == ESP_OK || ssidResult == ESP_ERR_NVS_NOT_FOUND) && (passwordResult == ESP_OK || passwordResult == ESP_ERR_NVS_NOT_FOUND);
+		}
+	}
+	written = written && nvs_commit(handle) == ESP_OK;
 	nvs_close(handle);
 	return written;
 }
 
+void SavedNetworks::add(const NetworkSettings& settings)
+{
+	if (defaultOnly)
+	{
+		count = 0;
+		defaultOnly = false;
+	}
+
+	size_t position = count;
+	for (size_t i = 0; i < count; ++i)
+		if (!strcmp(networks[i].ssid, settings.ssid))
+			position = i;
+	if (position == maxCount)
+		--position;
+	else if (position == count)
+		++count;
+
+	for (size_t i = position; i > 0; --i)
+		networks[i] = networks[i - 1];
+	networks[0] = settings;
+
+	strlcpy(hostname, settings.hostname, sizeof(hostname));
+	for (size_t i = 0; i < count; ++i)
+		strlcpy(networks[i].hostname, hostname, sizeof(networks[i].hostname));
+}
+
+void SavedNetworks::erase()
+{
+	nvs_handle_t handle;
+	if (nvs_open(nvsNamespace, NVS_READWRITE, &handle) != ESP_OK)
+		return;
+	if (nvs_erase_all(handle) != ESP_OK || nvs_commit(handle) != ESP_OK)
+		ESP_LOGE(tag, "erasing the network settings failed");
+	nvs_close(handle);
+}
 const char* NetworkSettings::validate() const
 {
 	if (!ssid[0])
@@ -95,16 +170,6 @@ const char* NetworkSettings::validate() const
 		return "A hostname has only the letters a-z, digits and '-', and does not start or end with '-'.";
 
 	return nullptr;
-}
-
-void NetworkSettings::erase()
-{
-	nvs_handle_t handle;
-	if (nvs_open(nvsNamespace, NVS_READWRITE, &handle) != ESP_OK)
-		return;
-	if (nvs_erase_all(handle) != ESP_OK || nvs_commit(handle) != ESP_OK)
-		ESP_LOGE(tag, "erasing the network settings failed");
-	nvs_close(handle);
 }
 
 void NetworkSettings::getDeviceId(char* const id, const size_t size)

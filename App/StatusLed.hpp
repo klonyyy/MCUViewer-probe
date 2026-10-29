@@ -12,7 +12,7 @@
  * @brief The status LED: a WS2812 RGB LED, driven by RMT.
  *
  * It shows the first of these that applies:
- * - the setup button held: white blinks that speed up until the saved network is forgotten;
+ * - the setup button held: white blinks that speed up until the saved networks are forgotten;
  * - identification: fast white blinks for a few seconds, when a host asked which probe this is;
  * - an alert: one amber flash when samples or SWO bytes were dropped, one red flash when an access to the target
  *   failed, red blinks when the target was lost or a Wi-Fi join failed;
