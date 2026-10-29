@@ -2,6 +2,8 @@
 
 Wireless ESP32-S3 port of [Black Magic Debug Probe](https://codeberg.org/blackmagic-debug/blackmagic) optimized for high speed RAM readout for [MCUViewer](https://mcuviewer.com).
 
+<img src="wireless-probe-demo.webp" alt="Wireless probe demo" width="600">
+
 ## Why 
 
 I was fed up with the need to connect STLink with USB cable to the mobile robot I'm working on. It should be suitable for all other projects such as drones, power electronics circuits, basically wherever having a cable is problematic. Best part - it's very fast and flashing works out of the box with GDB server.
