@@ -7,7 +7,7 @@ Wireless ESP32-S3 port of [Black Magic Debug Probe](https://codeberg.org/blackma
 I was fed up with the need to connect STLink with USB cable to the mobile robot I'm working on. It should be suitable for all other projects such as drones, power electronics circuits, basically wherever having a cable is problematic. Best part - it's very fast and flashing works out of the box with GDB server.
 
 <img src="wireless-probe.jpg" alt="Wireless probe" width="400">
-
+<img src="wireless-probe-back.jpg" alt="Wireless probe back side" width="400">
 
 The probe serves two kinds of clients, one session at a time:
 
