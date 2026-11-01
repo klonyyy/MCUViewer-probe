@@ -1,0 +1,44 @@
+menu "ESP-NOW bench"
+
+    config ESPNOW_BENCH_CHANNEL
+        int "Channel"
+        range 1 13
+        default 6
+        help
+            Channel the initiator runs on when it joins no network. A board that waits for an initiator
+            hops through the channels until one finds it.
+
+    config ESPNOW_BENCH_WINDOW
+        int "Frames in flight"
+        range 1 8
+        default 2
+        help
+            Frames handed to ESP-NOW before the send callback of the first one came. Espressif recommends
+            waiting for each callback, which is 1.
+
+    config ESPNOW_BENCH_STREAM_MS
+        int "Throughput test duration (ms)"
+        range 500 10000
+        default 2000
+
+    config ESPNOW_BENCH_WIFI_SSID
+        string "Wi-Fi network for the station test"
+        default ""
+        help
+            With a network set, the initiator joins it before the tests, so they run on the network's
+            channel next to a station link, like a probe on Wi-Fi with a dongle. Put real credentials in
+            sdkconfig.local (git-ignored).
+
+    config ESPNOW_BENCH_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config ESPNOW_BENCH_BUTTON_GPIO
+        int "Start button GPIO"
+        range 0 48
+        default 0
+        help
+            Active low, with the internal pull-up. A press makes this board the initiator. The default GPIO0
+            is the BOOT button.
+
+endmenu
