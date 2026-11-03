@@ -1,5 +1,20 @@
+# Each ESP-IDF project has its own compilation database; the shared components are built by the probe
+If:
+  PathMatch: (probe|components)/.*
 CompileFlags:
-  CompilationDatabase: build
+  CompilationDatabase: probe/build
+---
+If:
+  PathMatch: Tools/espnow_bench/.*
+CompileFlags:
+  CompilationDatabase: Tools/espnow_bench/build
+---
+If:
+  PathMatch: Tools/wifi_dongle/.*
+CompileFlags:
+  CompilationDatabase: Tools/wifi_dongle/build
+---
+CompileFlags:
   # Xtensa GCC options from the ESP-IDF toolchain that clang doesn't know
   Remove:
     - -mlongcalls

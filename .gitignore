@@ -1,9 +1,9 @@
-# ESP-IDF build output and local configuration
+# ESP-IDF build output and local configuration, in every project
 build*/
-/sdkconfig
-/sdkconfig.old
-/sdkconfig.local
-/managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.local
+managed_components/
 
 # clangd
 .cache/

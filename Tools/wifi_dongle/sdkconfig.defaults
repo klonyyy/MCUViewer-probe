@@ -1,0 +1,10 @@
+# Any ESP32-S3 board with the USB connector on the chip's own USB pins (GPIO19/20)
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+
+# The USB side: a network adapter (CDC-NCM), which Windows 11 and Linux drive without a driver install
+CONFIG_TINYUSB_NET_MODE_NCM=y

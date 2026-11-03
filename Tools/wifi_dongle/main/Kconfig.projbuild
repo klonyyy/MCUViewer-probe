@@ -1,0 +1,39 @@
+menu "Wi-Fi dongle"
+
+    config DONGLE_WIFI_SSID
+        string "Network to join (empty: the nearest probe)"
+        default ""
+        help
+            Empty joins the strongest probe access point in range, network-probe-xxxxxx. Name a network
+            to join that one instead, for example one probe's access point.
+
+    config DONGLE_WIFI_PASSWORD
+        string "Network password"
+        default ""
+        help
+            A probe's access point is open unless CONFIG_NETWORK_PROBE_AP_PASSWORD is set on the probe.
+            Put a real password in sdkconfig.local (git-ignored).
+
+    config DONGLE_LED_GPIO
+        int "Status LED GPIO (-1 = none)"
+        range -1 48
+        default 21
+        help
+            Data input of a WS2812 RGB LED. The default GPIO21 is the RGB LED of the Waveshare
+            ESP32-S3-Pico.
+
+    choice DONGLE_LED_ORDER
+        prompt "Status LED color order"
+        default DONGLE_LED_ORDER_RGB
+        help
+            Byte order the LED expects. If red shows as green, pick the other one.
+
+        config DONGLE_LED_ORDER_RGB
+            bool "RGB (Waveshare ESP32-S3-Pico)"
+
+        config DONGLE_LED_ORDER_GRB
+            bool "GRB (most WS2812)"
+
+    endchoice
+
+endmenu

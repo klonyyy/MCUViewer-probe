@@ -8,7 +8,7 @@ if(NOT IDF_TARGET STREQUAL "esp32s3")
     message(FATAL_ERROR "NETWORK PROBE runs on the ESP32-S3, the build is set up for ${IDF_TARGET}: run `idf.py set-target esp32s3`")
 endif()
 
-get_filename_component(bmd_dir "${CMAKE_CURRENT_LIST_DIR}/../External/blackmagic" ABSOLUTE)
+get_filename_component(bmd_dir "${CMAKE_CURRENT_LIST_DIR}/../../External/blackmagic" ABSOLUTE)
 set(bmd_src "${bmd_dir}/src")
 
 set(bmd_core_srcs

@@ -15,5 +15,6 @@ idf_component_register(
         TargetLink.cpp
         Wifi.cpp
     INCLUDE_DIRS .
+    REQUIRES network_probe_proto
     PRIV_REQUIRES Platform esp_app_format esp_driver_gpio esp_driver_rmt esp_driver_uart esp_event esp_hal_uart esp_http_server esp_hw_support esp_netif esp_rom esp_timer esp_wifi heap lwip nvs_flash vfs
 )

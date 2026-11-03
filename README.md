@@ -63,9 +63,21 @@ Requires ESP-IDF v6.1.
 
 ```
 git submodule update --init
+cd probe
 idf.py build
 idf.py -p <PORT> flash monitor
 ```
+
+Local settings, such as a default Wi-Fi network, go in `probe/sdkconfig.local` (git-ignored).
+
+The repository holds one ESP-IDF project per firmware:
+
+| Directory | Contents |
+|---|---|
+| `probe/` | the probe firmware |
+| `components/` | what the firmwares share: the NETWORK PROBE protocol |
+| `External/blackmagic` | Black Magic Debug, a git submodule |
+| `Tools/` | the timing test and development tools (ESP-NOW bench) |
 
 ## Connecting the probe to Wi-Fi
 
@@ -154,4 +166,5 @@ python Tools/read_timing.py --help
 
 ## Licensing
 
-The firmware is GPL-3.0-or-later (see `COPYING`), as it links Black Magic Debug.
+The probe firmware is GPL-3.0-or-later (see `COPYING`), as it links Black Magic Debug. The NETWORK PROBE
+protocol header in `components/network_probe_proto` and the tools under `Tools/espnow_bench` are MIT.
