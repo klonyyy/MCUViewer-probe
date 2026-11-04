@@ -245,7 +245,7 @@ NetworkProbe::Status ProbeService::handleReadBulk(const uint8_t* const payload, 
 		if (!chunk)
 			return NetworkProbe::Status::NOT_CONNECTED;
 
-		const uint32_t chunkLength = std::min<uint32_t>(HostLink::bulkChunkSize, total - offset);
+		const uint32_t chunkLength = std::min<uint32_t>(link->bulkChunkLength.load(std::memory_order_relaxed), total - offset);
 		for (uint32_t filled = 0; filled < chunkLength;)
 		{
 			const uint32_t pageAddress = address + offset + filled;

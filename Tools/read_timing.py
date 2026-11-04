@@ -6,12 +6,16 @@ Timing and data check of a NETWORK PROBE over its protocol: network round trip, 
 buffer read the way MCUViewer's recorder reads it, and the HSS sampling rate. It only reads; the target keeps running.
 
     python Tools/read_timing.py 192.168.1.19 --clock 4000,8000 --flash 0x08000000
+    python Tools/read_timing.py --serial COM5 --probe network-probe-a1b2c3
 
 --ram is where the timing reads go (default 0x20000000), with --buffer bytes read from there as one recorder buffer
 (default 120000, the STM32G474 has 128 KiB of contiguous SRAM). --flash names memory that does not change: there READ and
 READ_BULK are compared byte for byte, with 32-, 16- and 8-bit accesses, and --dump/--compare save or check a reference
 taken with another firmware. Without an address the probe is discovered. A probe that serves another session is left
 alone unless --force, as connecting takes the session over.
+
+--serial goes through an ESP-NOW dongle on that serial port instead (needs pyserial): the probes the dongle hears are
+discovered, and --probe picks one by its id, else the first that answers is taken.
 """
 
 import argparse
@@ -28,17 +32,30 @@ MAGIC = 0x564D
 
 HELLO, CONNECT, DISCONNECT, READ, READ_LIST, DISCOVER = 0x01, 0x02, 0x03, 0x04, 0x06, 0x09
 SET_PLAN, START, STOP, READ_BULK = 0x10, 0x11, 0x12, 0x15
+DONGLE_SELECT = 0x40
 RESP, DATA, EVENT, READ_DATA = 0x80, 0x81, 0x82, 0x84
 
 CAP_STREAM, CAP_READ_BULK = 1 << 2, 1 << 5
 EVENT_BUFFER_OVERFLOW = 2
-STATUS = {0: "OK", 1: "MALFORMED", 2: "UNSUPPORTED", 3: "NOT_CONNECTED", 4: "TARGET_ERROR", 5: "NO_TARGET", 6: "BUSY"}
+STATUS = {0: "OK", 1: "MALFORMED", 2: "UNSUPPORTED", 3: "NOT_CONNECTED", 4: "TARGET_ERROR", 5: "NO_TARGET", 6: "BUSY", 7: "NO_PROBE"}
 SESSION = {0: "free", 1: "host", 2: "gdb"}
 
 
 def frame(frame_type, payload, seq):
     body = struct.pack("<HBBHH", MAGIC, 1, frame_type, len(payload), seq) + payload
     return body + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF)
+
+
+def parse_discover(payload):
+    """Returns (session, [name, firmware, id, hostname]) of a RESP payload answering DISCOVER, or None."""
+    if len(payload) < 8 or payload[0] != DISCOVER or payload[1] != 0:
+        return None
+    session = payload[6]
+    strings, at = [], 8
+    while len(strings) < 4 and at < len(payload):
+        strings.append(payload[at + 1:at + 1 + payload[at]].decode(errors="replace"))
+        at += 1 + payload[at]
+    return session, strings
 
 
 def discover(timeout=1.5):
@@ -65,19 +82,71 @@ class ProbeError(Exception):
     pass
 
 
-class Probe:
+class TcpLink:
+    """The probe's protocol port."""
+
     def __init__(self, host, port):
         self.sock = socket.create_connection((host, port), timeout=5)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def send(self, data):
+        self.sock.sendall(data)
+
+    def recv(self, timeout):
+        """Returns what came within timeout seconds, b"" when nothing did."""
+        self.sock.settimeout(timeout)
+        try:
+            chunk = self.sock.recv(1 << 16)
+        except socket.timeout:
+            return b""
+        if not chunk:
+            raise ProbeError("the probe closed the connection")
+        return chunk
+
+    def close(self):
+        self.sock.close()
+
+
+class SerialLink:
+    """An ESP-NOW dongle's serial port: the same byte stream of frames as over TCP."""
+
+    def __init__(self, port):
+        import serial  # pyserial, only needed here
+
+        # Opening raises DTR, which the dongle takes as the host coming; closing ends its session. The timeout stays:
+        # changing it reconfigures the port, which costs milliseconds and sends the line state to the dongle again
+        self.port = serial.Serial(port, timeout=0.01)
+
+    def send(self, data):
+        self.port.write(data)
+
+    def recv(self, timeout):
+        end = time.monotonic() + timeout
+        while True:
+            first = self.port.read(1)
+            if first:
+                return first + self.port.read(self.port.in_waiting)
+            if time.monotonic() >= end:
+                return b""
+
+    def close(self):
+        self.port.close()
+
+
+class Probe:
+    def __init__(self, link):
+        self.link = link
         self.seq = 0
         self.rx = bytearray()
         self.on_data = None
         self.on_event = None
 
     def close(self):
-        self.sock.close()
+        self.link.close()
 
-    def _frame(self):
+    def _frame(self, timeout):
+        """Returns (type, seq, payload) of the next frame, or None when none came within timeout seconds."""
+        end = time.monotonic() + timeout
         while True:
             if len(self.rx) >= 8:
                 magic, version, frame_type, length, seq = struct.unpack_from("<HBBHH", self.rx)
@@ -89,10 +158,24 @@ class Probe:
                     if struct.unpack_from("<I", whole, 8 + length)[0] != zlib.crc32(whole[:8 + length]) & 0xFFFFFFFF:
                         raise ProbeError("CRC mismatch")
                     return frame_type, seq, whole[8:8 + length]
-            chunk = self.sock.recv(1 << 16)
-            if not chunk:
-                raise ProbeError("the probe closed the connection")
-            self.rx += chunk
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            self.rx += self.link.recv(left)
+
+    def discover(self, timeout=1.5):
+        """Through a dongle: returns {id: (session, hostname)} of every probe that answers a DISCOVER broadcast."""
+        # seq 0, which request() does not use before it wraps, so a late answer cannot pass for another
+        self.link.send(frame(DISCOVER, struct.pack("<H", PROTOCOL), 0))
+        found = {}
+        end = time.monotonic() + timeout
+        while True:
+            got = self._frame(end - time.monotonic())
+            if got is None:
+                return found
+            answer = parse_discover(got[2]) if got[0] == RESP else None
+            if answer and len(answer[1]) >= 3:
+                found[answer[1][2]] = (answer[0], answer[1][3] if len(answer[1]) > 3 else "")
 
     def _dispatch(self, frame_type, payload):
         if frame_type == DATA and self.on_data:
@@ -103,9 +186,12 @@ class Probe:
     def request(self, request_type, payload=b"", bulk=None):
         """Sends a request and returns (status, data) of its RESP. READ_DATA of the request goes into bulk."""
         self.seq = (self.seq + 1) & 0xFFFF
-        self.sock.sendall(frame(request_type, payload, self.seq))
+        self.link.send(frame(request_type, payload, self.seq))
         while True:
-            frame_type, seq, body = self._frame()
+            got = self._frame(5)
+            if got is None:
+                raise ProbeError("no answer to request 0x%02X" % request_type)
+            frame_type, seq, body = got
             if frame_type == RESP and seq == self.seq:
                 if body[0] != request_type:
                     raise ProbeError("answer to the wrong request")
@@ -121,16 +207,10 @@ class Probe:
     def pump(self, seconds):
         """Handles DATA and EVENT frames for a while."""
         end = time.monotonic() + seconds
-        self.sock.settimeout(0.05)
-        try:
-            while time.monotonic() < end:
-                try:
-                    frame_type, _, body = self._frame()
-                except socket.timeout:
-                    continue
-                self._dispatch(frame_type, body)
-        finally:
-            self.sock.settimeout(5)
+        while time.monotonic() < end:
+            got = self._frame(min(0.05, max(0.0, end - time.monotonic())))
+            if got is not None:
+                self._dispatch(got[0], got[2])
 
     def read(self, address, length):
         status, data = self.request(READ, struct.pack("<IH", address, length))
@@ -226,18 +306,36 @@ def main():
     parser.add_argument("--hss-period", type=int, default=100, help="HSS sampling period in us; 1 samples as fast as the probe can")
     parser.add_argument("--repeat", type=int, default=40)
     parser.add_argument("--force", action="store_true", help="take over a probe that serves another session")
+    parser.add_argument("--serial", help="serial port of an ESP-NOW dongle (COM5, /dev/ttyACM0) to reach the probe through")
+    parser.add_argument("--probe", help="with --serial: id of the probe to select, network-probe-xxxxxx")
     args = parser.parse_args()
 
-    probes = discover()
-    host = args.host or (probes[0][0] if probes else None)
-    if not host:
-        sys.exit("No probe answered the discovery; give its address.")
-    session = {p[0]: p[2] for p in probes}.get(host)
-    print("probe %s, session %s" % (host, SESSION.get(session, "unknown") if session is not None else "not discovered"))
-    if session not in (None, 0) and not args.force:
-        sys.exit("The probe serves another session; --force takes it over.")
+    if args.serial:
+        probe = Probe(SerialLink(args.serial))
+        found = probe.discover()
+        if not found:
+            sys.exit("No probe answered through the dongle: is it on the probe's channel?")
+        probe_id = args.probe or next(iter(found))
+        if probe_id not in found:
+            sys.exit("%s did not answer; these did: %s" % (probe_id, ", ".join(found)))
+        session = found[probe_id][0]
+        print("probe %s (%s) through the dongle, session %s" % (probe_id, found[probe_id][1], SESSION.get(session, "unknown")))
+        if session != 0 and not args.force:
+            sys.exit("The probe serves another session; --force takes it over.")
+        status, _ = probe.request(DONGLE_SELECT, bytes([len(probe_id)]) + probe_id.encode())
+        if status != 0:
+            sys.exit("DONGLE_SELECT: %s" % STATUS.get(status, status))
+    else:
+        probes = discover()
+        host = args.host or (probes[0][0] if probes else None)
+        if not host:
+            sys.exit("No probe answered the discovery; give its address.")
+        session = {p[0]: p[2] for p in probes}.get(host)
+        print("probe %s, session %s" % (host, SESSION.get(session, "unknown") if session is not None else "not discovered"))
+        if session not in (None, 0) and not args.force:
+            sys.exit("The probe serves another session; --force takes it over.")
+        probe = Probe(TcpLink(host, args.port))
 
-    probe = Probe(host, args.port)
     status, hello = probe.request(HELLO, struct.pack("<H", PROTOCOL))
     if status != 0:
         sys.exit("HELLO: %s" % STATUS.get(status, status))

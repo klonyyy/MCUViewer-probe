@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
@@ -19,6 +20,7 @@
 #include "Wifi.hpp"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "esp_vfs_eventfd.h"
@@ -79,6 +81,9 @@ void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCa
 	static_assert(NetworkProbe::helloResponseFixedSize + 3U * (1U + UINT8_MAX) + NetworkProbe::helloSwoSize <= localFrameSize - NetworkProbe::frameOverhead - NetworkProbe::respHeaderSize, "a HELLO answer must fit");
 	static_assert(dataTargetPayload <= HostLink::maxPayload, "an SWO_DATA frame must fit");
 	static_assert(NetworkProbe::readDataHeaderSize + HostLink::bulkChunkSize <= HostLink::maxPayload, "a READ_DATA frame must fit");
+	/* Over ESP-NOW, every frame the net task sends must fit one packet: the session limits cover the rest */
+	static_assert(localFrameSize <= EspNowLink::maxFrame && discoveryFrameSize <= EspNowLink::maxFrame, "answers must fit an ESP-NOW packet");
+	static_assert(dataTargetPayload <= EspNowLink::maxPayload && NetworkProbe::dataHeaderSize + HostLink::maxSampleBytes <= EspNowLink::maxPayload, "DATA and SWO_DATA must fit an ESP-NOW packet");
 
 	link = &hostLink;
 	swo = &swoCapture;
@@ -116,6 +121,7 @@ void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCa
 
 	ESP_LOGI(tag, "NETWORK PROBE protocol listening on TCP port %d, id %s", CONFIG_NETWORK_PROBE_PORT, probeId);
 	openDiscoverySocket();
+	EspNowPort::start(link->netWakeFd);
 	xTaskCreatePinnedToCore(taskEntry, "net", taskStackSize, this, taskPriority, nullptr, taskCore);
 }
 
@@ -133,7 +139,8 @@ void NetServer::run()
 	{
 		serviceLink();
 		swo->poll();
-		if (clientSocket >= 0 && !pumpTx())
+		serviceEspNow();
+		if (hasClient() && !pumpTx())
 			closeClient();
 
 		const bool watchGdb = !link->gdbRequested.load(std::memory_order_acquire) && !link->gdbActive.load(std::memory_order_acquire);
@@ -158,7 +165,7 @@ void NetServer::run()
 			FD_SET(discoverySocket, &readSet);
 			maxSocket = std::max(maxSocket, discoverySocket);
 		}
-		if (clientSocket >= 0)
+		if (client == Client::tcp)
 		{
 			FD_SET(clientSocket, &readSet);
 			/* Only while a frame is stuck in a full window, else select() would return at once */
@@ -167,11 +174,15 @@ void NetServer::run()
 			maxSocket = std::max(maxSocket, clientSocket);
 		}
 
-		/* Samples and SWO bytes are flushed on time, so wake up regularly while they may come; the eventfd covers the rest */
-		const bool samplesMayCome = clientSocket >= 0 && (link->streaming.load(std::memory_order_acquire) || link->ring.available() > 0 || swo->isCapturing());
+		/*
+		 * Samples and SWO bytes are flushed on time, so wake up regularly while they may come, and now and then while an
+		 * ESP-NOW session may fall silent; the eventfd covers the rest, ESP-NOW packets and send callbacks included
+		 */
+		const bool samplesMayCome = hasClient() && (link->streaming.load(std::memory_order_acquire) || link->ring.available() > 0 || swo->isCapturing());
 		timeval timeout = {};
-		timeout.tv_usec = pollMs * 1000U;
-		const int ready = select(maxSocket + 1, &readSet, &writeSet, nullptr, samplesMayCome ? &timeout : nullptr);
+		timeout.tv_usec = (samplesMayCome ? pollMs : sessionPollMs) * 1000U;
+		const bool timed = samplesMayCome || client == Client::espnow;
+		const int ready = select(maxSocket + 1, &readSet, &writeSet, nullptr, timed ? &timeout : nullptr);
 		if (ready < 0)
 		{
 			ESP_LOGW(tag, "select() failed: errno %d", errno);
@@ -190,7 +201,7 @@ void NetServer::run()
 			answerDatagram();
 		if (watchGdb && FD_ISSET(gdbListenSocket, &readSet))
 		{
-			if (clientSocket >= 0)
+			if (hasClient())
 				refuseGdbClient();
 			else
 			{
@@ -199,7 +210,7 @@ void NetServer::run()
 				link->wakeProbe();
 			}
 		}
-		if (clientSocket >= 0 && FD_ISSET(clientSocket, &readSet) && !receive())
+		if (client == Client::tcp && FD_ISSET(clientSocket, &readSet) && !receive())
 			closeClient();
 	}
 }
@@ -216,7 +227,7 @@ void NetServer::acceptClient()
 	}
 
 	/* A new client takes over: the old connection may be a half-open leftover of a crashed host */
-	if (clientSocket >= 0)
+	if (hasClient())
 	{
 		ESP_LOGI(tag, "a new client takes over the session");
 		closeClient();
@@ -227,6 +238,16 @@ void NetServer::acceptClient()
 	inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
 	ESP_LOGI(tag, "client connected from %s", peerName);
 	clientSocket = sock;
+	startSession(Client::tcp, HostLink::maxPayload);
+}
+
+void NetServer::startSession(const Client kind, const uint16_t maxPayload)
+{
+	client = kind;
+	sessionMaxPayload = std::min(maxPayload, HostLink::maxPayload);
+	/* WRITE carries the most besides its data; a multiple of 4, as READ_BULK chunks keep the access width */
+	sessionMaxRead = std::min<uint16_t>(HostLink::maxRead, (sessionMaxPayload - NetworkProbe::writeRequestHeaderSize) & ~3U);
+	link->bulkChunkLength.store(sessionMaxRead, std::memory_order_relaxed);
 	StatusLed::setHostConnected(true);
 	rxLength = 0;
 	txLength = 0;
@@ -235,14 +256,24 @@ void NetServer::acceptClient()
 	frameSeq = 0;
 }
 
-void NetServer::closeClient()
+void NetServer::closeClient(const bool tellPeer)
 {
-	if (clientSocket >= 0)
+	if (client == Client::tcp)
 	{
 		shutdown(clientSocket, SHUT_RDWR);
 		close(clientSocket);
 		ESP_LOGI(tag, "client disconnected");
 	}
+	else if (client == Client::espnow)
+	{
+		/* Best effort: a dongle that misses it finds out by its next frames going unanswered */
+		if (tellPeer)
+			EspNowPort::send(espnowPeer, EspNowLink::Kind::CLOSE, espnowSession, nullptr, 0);
+		memcpy(endedPeer, espnowPeer, sizeof(endedPeer));
+		endedSession = espnowSession;
+		ESP_LOGI(tag, "ESP-NOW session %u ended", espnowSession);
+	}
+	client = Client::none;
 	clientSocket = -1;
 	StatusLed::setHostConnected(false);
 	rxLength = 0;
@@ -304,26 +335,13 @@ void NetServer::answerDatagram()
 		return;
 
 	NetworkProbe::FrameHeader header;
-	if (!NetworkProbe::decodeHeader(request, header) || received != static_cast<ssize_t>(NetworkProbe::frameOverhead + header.length))
+	if (!checkFrame(request, static_cast<size_t>(received), header))
 		return;
-	if (NetworkProbe::getU32(request + NetworkProbe::headerSize + header.length) != esp_rom_crc32_le(0, request, NetworkProbe::headerSize + header.length))
+	const size_t length = answerDiscovery(header, request + NetworkProbe::headerSize);
+	if (!length)
 		return;
-
-	uint8_t* const frame = discoveryFrame.data();
-	const uint8_t* const payload = request + NetworkProbe::headerSize;
-	uint16_t dataLength = 0;
-	if (header.type == NetworkProbe::Type::DISCOVER && header.length == NetworkProbe::discoverRequestSize)
-		dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize);
-	else if (header.type == NetworkProbe::Type::IDENTIFY && header.length == 1U + payload[0] && payload[0] == strlen(probeId) && !memcmp(payload + 1, probeId, payload[0]))
-		StatusLed::identify();
-	else
-		return;
-
-	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(header.type);
-	frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(NetworkProbe::Status::OK);
-	const size_t length = sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + dataLength, header.seq);
 	/* Non-blocking: with the send buffer full the answer is dropped, and the host asks again */
-	sendto(discoverySocket, frame, length, 0, reinterpret_cast<const sockaddr*>(&peer), peerLength);
+	sendto(discoverySocket, discoveryFrame.data(), length, 0, reinterpret_cast<const sockaddr*>(&peer), peerLength);
 
 	char peerName[16];
 	inet_ntoa_r(peer.sin_addr, peerName, sizeof(peerName));
@@ -333,12 +351,113 @@ void NetServer::answerDatagram()
 		ESP_LOGD(tag, "answered DISCOVER from %s", peerName);
 }
 
+bool NetServer::checkFrame(const uint8_t* const data, const size_t length, NetworkProbe::FrameHeader& header)
+{
+	if (length < NetworkProbe::frameOverhead || !NetworkProbe::decodeHeader(data, header) || length != NetworkProbe::frameOverhead + header.length)
+		return false;
+	return NetworkProbe::getU32(data + NetworkProbe::headerSize + header.length) == esp_rom_crc32_le(0, data, NetworkProbe::headerSize + header.length);
+}
+
+size_t NetServer::answerDiscovery(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
+{
+	uint8_t* const frame = discoveryFrame.data();
+	uint16_t dataLength = 0;
+	if (header.type == NetworkProbe::Type::DISCOVER && header.length == NetworkProbe::discoverRequestSize)
+		dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize);
+	else if (header.type == NetworkProbe::Type::IDENTIFY && header.length == 1U + payload[0] && payload[0] == strlen(probeId) && !memcmp(payload + 1, probeId, payload[0]))
+		StatusLed::identify();
+	else
+		return 0;
+
+	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(header.type);
+	frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(NetworkProbe::Status::OK);
+	return sealFrame(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize + dataLength, header.seq);
+}
+
+void NetServer::serviceEspNow()
+{
+	while (EspNowPort::Packet* const packet = EspNowPort::receive())
+	{
+		handlePacket(*packet);
+		EspNowPort::release(packet);
+	}
+
+	if (client == Client::espnow && esp_timer_get_time() - espnowLastRx > EspNowLink::sessionTimeoutMs * 1000LL)
+	{
+		ESP_LOGW(tag, "nothing from the ESP-NOW client for %" PRIu32 " ms", EspNowLink::sessionTimeoutMs);
+		closeClient();
+	}
+}
+
+void NetServer::handlePacket(const EspNowPort::Packet& packet)
+{
+	EspNowLink::Header linkHeader;
+	if (!EspNowLink::decodeHeader(packet.data, packet.length, linkHeader))
+		return;
+	const bool current = client == Client::espnow && linkHeader.session == espnowSession && !memcmp(packet.mac, espnowPeer, sizeof(espnowPeer));
+	if (current)
+		espnowLastRx = esp_timer_get_time();
+
+	if (linkHeader.kind == EspNowLink::Kind::PING)
+		return;
+	if (linkHeader.kind == EspNowLink::Kind::CLOSE)
+	{
+		if (current)
+		{
+			ESP_LOGI(tag, "the ESP-NOW client closed the session");
+			closeClient(false);
+		}
+		return;
+	}
+
+	const uint8_t* const frame = packet.data + EspNowLink::headerSize;
+	NetworkProbe::FrameHeader header;
+	if (!checkFrame(frame, packet.length - EspNowLink::headerSize, header))
+		return;
+	const uint8_t* const payload = frame + NetworkProbe::headerSize;
+
+	if (linkHeader.session == EspNowLink::noSession)
+	{
+		const size_t length = answerDiscovery(header, payload);
+		if (length)
+		{
+			/* With the window full the answer is dropped, and the host asks again */
+			EspNowPort::send(packet.mac, EspNowLink::Kind::DATA, EspNowLink::noSession, discoveryFrame.data(), length);
+			if (header.type == NetworkProbe::Type::IDENTIFY)
+				ESP_LOGI(tag, "identifying, as " MACSTR " asked", MAC2STR(packet.mac));
+		}
+		return;
+	}
+	if (!current)
+	{
+		if (linkHeader.session == endedSession && !memcmp(packet.mac, endedPeer, sizeof(endedPeer)))
+			return;
+		openEspNowSession(packet.mac, linkHeader.session);
+	}
+	if (!handleFrame(header, payload))
+		closeClient();
+}
+
+void NetServer::openEspNowSession(const uint8_t* const mac, const uint16_t session)
+{
+	if (hasClient())
+	{
+		ESP_LOGI(tag, "an ESP-NOW client takes over the session");
+		closeClient();
+	}
+	memcpy(espnowPeer, mac, sizeof(espnowPeer));
+	espnowSession = session;
+	espnowLastRx = esp_timer_get_time();
+	ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected, session %u", MAC2STR(mac), session);
+	startSession(Client::espnow, EspNowLink::maxPayload);
+}
+
 uint16_t NetServer::buildDiscover(uint8_t* const data) const
 {
 	NetworkProbe::Session session = NetworkProbe::Session::FREE;
 	if (link->gdbRequested.load(std::memory_order_acquire) || link->gdbActive.load(std::memory_order_acquire))
 		session = NetworkProbe::Session::GDB;
-	else if (clientSocket >= 0)
+	else if (hasClient())
 		session = NetworkProbe::Session::HOST;
 
 	NetworkProbe::putU16(data, NetworkProbe::protocolVersion);
@@ -420,6 +539,9 @@ bool NetServer::handleFrame(const NetworkProbe::FrameHeader& header, const uint8
 		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::BUSY, 0);
 	if (header.type == NetworkProbe::Type::SWO_START || header.type == NetworkProbe::Type::SWO_STOP)
 		return handleSwoRequest(header, payload);
+	/* Its answer must fit the session's frames, over ESP-NOW one packet */
+	if (header.type == NetworkProbe::Type::READ && header.length == NetworkProbe::readRequestSize && NetworkProbe::getU16(payload + 4) > sessionMaxRead)
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::MALFORMED, 0);
 
 	/* Hand the request to the SWD owner task through the single slot; the answer comes back in nextFrame() */
 	link->requestType = header.type;
@@ -479,9 +601,9 @@ bool NetServer::queueLocalResponse(const uint16_t seq, const NetworkProbe::Type 
 uint16_t NetServer::buildHello(uint8_t* const data) const
 {
 	NetworkProbe::putU16(data, NetworkProbe::protocolVersion);
-	NetworkProbe::putU16(data + 2, HostLink::maxPayload);
+	NetworkProbe::putU16(data + 2, sessionMaxPayload);
 	NetworkProbe::putU32(data + 4, NetworkProbe::capSwd | NetworkProbe::capReset | NetworkProbe::capStream | NetworkProbe::capReadBulk | (swo->isAvailable() ? NetworkProbe::capSwo : 0U));
-	NetworkProbe::putU16(data + 8, HostLink::maxRead);
+	NetworkProbe::putU16(data + 8, sessionMaxRead);
 	data[10] = HostLink::maxList;
 	data[11] = HostLink::maxBlocks;
 	NetworkProbe::putU16(data + 12, HostLink::maxSampleBytes);
@@ -517,7 +639,7 @@ void NetServer::serviceLink()
 	}
 
 	/* An answer for a client that is gone, and the READ_BULK chunks before it; once the answer is there, so are they */
-	if (clientSocket < 0 || dropResponse)
+	if (!hasClient() || dropResponse)
 	{
 		const bool answered = link->slotState.load(std::memory_order_acquire) == HostLink::SlotState::response;
 		link->bulkSent.store(link->bulkWritten.load(std::memory_order_acquire), std::memory_order_release);
@@ -537,9 +659,24 @@ bool NetServer::pumpTx()
 	{
 		if (txSent == txLength)
 		{
+			/* A packet carries a whole frame: take the next one only while the ESP-NOW window has room */
+			if (client == Client::espnow && !EspNowPort::canSend())
+				return true;
 			if (!nextFrame(now))
 				return true;
 			StatusLed::activity();
+		}
+
+		if (client == Client::espnow)
+		{
+			/* Busy keeps the frame for when a send callback, or the next select() timeout, wakes the task */
+			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, EspNowLink::Kind::DATA, espnowSession, txFrame.data(), txLength);
+			if (result == EspNowPort::SendResult::busy)
+				return true;
+			if (result == EspNowPort::SendResult::failed)
+				return false;
+			txSent = txLength;
+			continue;
 		}
 
 		/* Partial sends are resumed from txSent; EAGAIN leaves the frame for the next select() round */

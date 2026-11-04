@@ -11,6 +11,8 @@
 
 #include <array>
 
+#include "EspNowLink.hpp"
+#include "EspNowPort.hpp"
 #include "HostLink.hpp"
 #include "NetworkProbeProto.hpp"
 #include "SwoCapture.hpp"
@@ -20,10 +22,14 @@ class Wifi;
 /**
  * @brief The net task, on core 0: the network side of the NETWORK PROBE protocol.
  *
- * It serves one client at a time on the protocol port; a new connection takes over the old one. It answers HELLO
- * itself, hands every other request to the SWD owner task through HostLink, and sends the answers, a READ_BULK answer
- * as READ_DATA frames while the SWD owner task reads on. It drains the sample ring into DATA frames and reports EVENTs.
- * Answers go out before samples, and the socket never blocks the task, so a full TCP window only fills the ring.
+ * It serves one client at a time, on the protocol port or over ESP-NOW through a dongle; a new client takes over from
+ * the old one. It answers HELLO itself, hands every other request to the SWD owner task through HostLink, and sends the
+ * answers, a READ_BULK answer as READ_DATA frames while the SWD owner task reads on. It drains the sample ring into DATA
+ * frames and reports EVENTs. Answers go out before samples, and sending never blocks the task, so a full TCP window or
+ * ESP-NOW window only fills the ring.
+ *
+ * ESP-NOW: each packet carries one frame, so an ESP-NOW session announces a smaller max_payload and max_read in HELLO,
+ * and READ_BULK chunks shrink to match. Sessions follow EspNowLink: they end with CLOSE or after a silence.
  *
  * SWO needs no SWD, so the net task owns the SWO capture: it answers SWO_START and SWO_STOP itself, and sends the
  * captured bytes in SWO_DATA frames, taking turns with DATA.
@@ -31,7 +37,8 @@ class Wifi;
  * It also watches the GDB port: a GDB client is handed to the SWD owner task when no NETWORK PROBE client is connected, and
  * refused otherwise. During a GDB session every request but HELLO is answered BUSY.
  *
- * Discovery: it answers DISCOVER and IDENTIFY datagrams on the UDP discovery port itself, in every session state.
+ * Discovery: it answers DISCOVER and IDENTIFY datagrams on the UDP discovery port, and ESP-NOW packets outside a
+ * session, itself, in every session state.
  */
 class NetServer
 {
@@ -54,17 +61,54 @@ class NetServer
 	static constexpr int64_t dataFlushUs = 10000;	   /**< A DATA frame goes out at least this often while sampling. */
 	static constexpr int64_t eventIntervalUs = 100000; /**< OVERFLOW and SAMPLE_ERRORS at most this often. */
 	static constexpr uint32_t pollMs = 5;			   /**< Wake-up period while samples may come. */
+	static constexpr uint32_t sessionPollMs = 100;	   /**< Wake-up period while an ESP-NOW session may fall silent. */
 	static constexpr size_t bufferSize = NetworkProbe::frameOverhead + HostLink::maxPayload;
 	static constexpr size_t localFrameSize = 1024; /**< HELLO, BUSY and other answers the net task gives itself. */
 	/** A DISCOVER answer, with its four strings at their longest. */
 	static constexpr size_t discoveryFrameSize = NetworkProbe::frameOverhead + NetworkProbe::respHeaderSize + NetworkProbe::discoverResponseFixedSize + 4 * (1 + UINT8_MAX);
 
+	enum class Client : uint8_t
+	{
+		none,
+		tcp,
+		espnow,
+	};
+
 	static void taskEntry(void* arg);
 	[[noreturn]] void run();
 
+	bool hasClient() const { return client != Client::none; }
 	void acceptClient();
-	void closeClient();
+
+	/**
+	 * @brief Takes a new client on, after the one before has gone.
+	 * @param maxPayload Largest frame payload the client's transport carries.
+	 */
+	void startSession(Client kind, uint16_t maxPayload);
+
+	/**
+	 * @param tellPeer Over ESP-NOW: send CLOSE, unless the dongle closed the session itself.
+	 */
+	void closeClient(bool tellPeer = true);
 	void refuseGdbClient();
+
+	/**
+	 * @brief Handles the ESP-NOW packets that came, and ends a session that fell silent.
+	 */
+	void serviceEspNow();
+	void handlePacket(const EspNowPort::Packet& packet);
+	void openEspNowSession(const uint8_t* mac, uint16_t session);
+
+	/**
+	 * @brief Checks that data holds exactly one frame, with a valid CRC.
+	 */
+	static bool checkFrame(const uint8_t* data, size_t length, NetworkProbe::FrameHeader& header);
+
+	/**
+	 * @brief Prepares the answer to a DISCOVER, or to an IDENTIFY with this probe's id, in discoveryFrame.
+	 * @return Size of the answer, or 0 when there is none.
+	 */
+	size_t answerDiscovery(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
 
 	/**
 	 * @brief Opens the UDP discovery port. Without it the probe works, but hosts have to know its address.
@@ -144,14 +188,15 @@ class NetServer
 	SwoCapture* swo = nullptr;
 	Wifi* wifi = nullptr;
 	int listenSocket = -1;
-	int clientSocket = -1;
+	Client client = Client::none;
+	int clientSocket = -1; /**< The TCP client's. */
 	int gdbListenSocket = -1;
 	int discoverySocket = -1;
 	char probeId[32] = {};
 
 	/** A datagram from the discovery port: one byte more than the longest request, an IDENTIFY, so a longer one shows by its size. */
 	std::array<uint8_t, NetworkProbe::frameOverhead + 1 + UINT8_MAX + 1> discoveryRequest;
-	std::array<uint8_t, discoveryFrameSize> discoveryFrame; /**< Its answer; localFrame may hold a TCP answer meanwhile. */
+	std::array<uint8_t, discoveryFrameSize> discoveryFrame; /**< An answer to DISCOVER or IDENTIFY; localFrame may hold a session answer meanwhile. */
 
 	std::array<uint8_t, bufferSize> rxBuffer;
 	size_t rxLength = 0;
@@ -162,6 +207,17 @@ class NetServer
 
 	std::array<uint8_t, localFrameSize> localFrame;
 	size_t localLength = 0;
+
+	/* The client session's limits, announced in HELLO */
+	uint16_t sessionMaxPayload = HostLink::maxPayload;
+	uint16_t sessionMaxRead = HostLink::maxRead;
+
+	/* The ESP-NOW client, and the last ESP-NOW session that ended, whose packets are dropped */
+	uint8_t espnowPeer[6] = {};
+	uint16_t espnowSession = EspNowLink::noSession;
+	int64_t espnowLastRx = 0;
+	uint8_t endedPeer[6] = {};
+	uint16_t endedSession = EspNowLink::noSession;
 
 	bool requestOutstanding = false; /**< A request was handed over and its answer is not sent yet. */
 	bool dropResponse = false;		 /**< The client of the outstanding request is gone. */

@@ -37,14 +37,15 @@ enum class Type : uint8_t
 	READ_LIST = 0x06,
 	RESET = 0x07,
 	GET_STATUS = 0x08,
-	DISCOVER = 0x09, /* over UDP only */
-	IDENTIFY = 0x0A, /* over UDP only */
+	DISCOVER = 0x09, /* over UDP or a dongle, outside the session */
+	IDENTIFY = 0x0A, /* over UDP or a dongle, outside the session */
 	SET_PLAN = 0x10,
 	START = 0x11,
 	STOP = 0x12,
 	SWO_START = 0x13,
 	SWO_STOP = 0x14,
 	READ_BULK = 0x15, /* answered with READ_DATA frames, then the RESP */
+	DONGLE_SELECT = 0x40, /* answered by an ESP-NOW dongle itself: the probe to talk to */
 	RESP = 0x80,
 	DATA = 0x81,
 	EVENT = 0x82,
@@ -61,6 +62,7 @@ enum class Status : uint8_t
 	TARGET_ERROR = 4, /* data: u8 fault */
 	NO_TARGET = 5,
 	BUSY = 6,
+	NO_PROBE = 7, /* from a dongle: no probe selected, or none with the id DONGLE_SELECT names */
 };
 
 /* The fault byte of Status::TARGET_ERROR */
@@ -149,6 +151,14 @@ constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a
 /*
  * IDENTIFY carries the id of the probe it is meant for, as a string. That probe blinks its LED for a few seconds and
  * answers OK without data; any other probe drops it. Like DISCOVER, it is answered in every session state.
+ */
+
+/*
+ * ESP-NOW dongle: a USB serial port carries the frames as the TCP connection does. The dongle broadcasts DISCOVER and
+ * IDENTIFY to the probes in range and passes their answers on. DONGLE_SELECT carries the id of a probe that answered
+ * DISCOVER, as a string, and starts a session with it; the dongle answers it itself, OK or NO_PROBE. The frames after
+ * it go to that probe, until the port closes or another DONGLE_SELECT; without a probe selected, the dongle answers
+ * requests NO_PROBE. Max_payload is smaller than over TCP, as one frame travels in one ESP-NOW packet.
  */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */

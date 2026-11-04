@@ -1,0 +1,33 @@
+menu "NETWORK PROBE dongle"
+
+    config DONGLE_CHANNEL
+        int "Wi-Fi channel"
+        range 1 13
+        default 6
+        help
+            ESP-NOW channel. A probe talks on the channel its radio is on: the channel of the network it
+            joined, or in setup mode the channel of its access point, 6 by default.
+
+    config DONGLE_LED_GPIO
+        int "Status LED GPIO (-1 = none)"
+        range -1 48
+        default 21
+        help
+            Data input of a WS2812 RGB LED. The default GPIO21 is the RGB LED of the Waveshare
+            ESP32-S3-Pico.
+
+    choice DONGLE_LED_ORDER
+        prompt "Status LED color order"
+        default DONGLE_LED_ORDER_RGB
+        help
+            Byte order the LED expects. If red shows as green, pick the other one.
+
+        config DONGLE_LED_ORDER_RGB
+            bool "RGB (Waveshare ESP32-S3-Pico)"
+
+        config DONGLE_LED_ORDER_GRB
+            bool "GRB (most WS2812)"
+
+    endchoice
+
+endmenu

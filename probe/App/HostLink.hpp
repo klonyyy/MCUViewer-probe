@@ -24,7 +24,8 @@
  * the response and sets it to response; the net task sends it and sets it back to empty.
  *
  * READ_BULK: the SWD owner task fills bulkChunks while the net task sends the filled ones as READ_DATA, so reading and
- * sending overlap. The response follows the last chunk.
+ * sending overlap. The response follows the last chunk. A chunk holds at most bulkChunkLength bytes, which the client
+ * session sets: over ESP-NOW a READ_DATA frame must fit one packet.
  *
  * Sessions: sessionGeneration counts the ended client sessions. When it changed, the SWD owner task stops streaming and
  * releases the target before it handles anything else, and samples of an older session are never sent.
@@ -36,7 +37,7 @@ struct HostLink
 	static constexpr uint8_t maxList = 255;			  /**< READ_LIST entries: count is a u8. */
 	static constexpr uint8_t maxBlocks = 128;		  /**< SET_PLAN blocks. */
 	static constexpr uint16_t maxSampleBytes = 1024;  /**< Sample record, t included. */
-	static constexpr uint16_t bulkChunkSize = maxRead; /**< READ_DATA bytes per frame. */
+	static constexpr uint16_t bulkChunkSize = maxRead; /**< READ_DATA bytes per frame at most. */
 	static constexpr uint32_t bulkSlots = 2;		   /**< One chunk is read while the other is sent. */
 
 	/**
@@ -86,6 +87,7 @@ struct HostLink
 	BulkChunk bulkChunks[bulkSlots];
 	std::atomic<uint32_t> bulkWritten{0}; /**< SWD owner task: chunks filled. */
 	std::atomic<uint32_t> bulkSent{0};	  /**< Net task: chunks sent or dropped. */
+	std::atomic<uint16_t> bulkChunkLength{bulkChunkSize}; /**< Net task, when a session starts: a multiple of 4. */
 
 	/* Samples, SWD owner task to net task */
 	SampleRing ring;

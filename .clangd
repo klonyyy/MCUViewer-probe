@@ -5,6 +5,11 @@ CompileFlags:
   CompilationDatabase: probe/build
 ---
 If:
+  PathMatch: dongle/.*
+CompileFlags:
+  CompilationDatabase: dongle/build
+---
+If:
   PathMatch: Tools/espnow_bench/.*
 CompileFlags:
   CompilationDatabase: Tools/espnow_bench/build

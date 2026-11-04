@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 
+#include "EspNowPort.hpp"
 #include "StatusLed.hpp"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -267,7 +268,10 @@ void Wifi::enterSetup()
 		status.setupMode = true;
 	}
 	if (wifiStarted)
+	{
+		EspNowPort::suspend();
 		ESP_ERROR_CHECK(esp_wifi_stop());
+	}
 	staBusy = false;
 	staLinked = false;
 
@@ -293,6 +297,7 @@ void Wifi::enterSetup()
 	ESP_ERROR_CHECK(esp_wifi_start());
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	wifiStarted = true;
+	EspNowPort::resume();
 
 	ESP_LOGI(tag, "setup mode: access point \"%s\"", deviceId);
 	if (saved.count)

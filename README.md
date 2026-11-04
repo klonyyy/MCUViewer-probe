@@ -75,7 +75,8 @@ The repository holds one ESP-IDF project per firmware:
 | Directory | Contents |
 |---|---|
 | `probe/` | the probe firmware |
-| `components/` | what the firmwares share: the NETWORK PROBE protocol |
+| `dongle/` | the ESP-NOW dongle: reaches probes without a router, over a USB serial port ([README](dongle/README.md)) |
+| `components/` | what the firmwares share: the NETWORK PROBE protocol and the ESP-NOW link |
 | `External/blackmagic` | Black Magic Debug, a git submodule |
 | `Tools/` | the timing test and development tools (ESP-NOW bench) |
 
@@ -157,14 +158,16 @@ gdb-multiarch firmware.elf
 READ and READ_BULK throughput, a recorder-sized buffer read the way MCUViewer does it, and the HSS
 sampling rate. With `--flash` it also compares READ and READ_BULK byte for byte, with 32-, 16- and
 8-bit accesses; `--dump` and `--compare` keep a reference taken with another firmware. It only
-reads, the target keeps running, and it leaves a probe alone that serves another session.
+reads, the target keeps running, and it leaves a probe alone that serves another session. With
+`--serial` it goes through an ESP-NOW dongle instead (needs `pip install pyserial`).
 
 ```
 python Tools/read_timing.py 192.168.1.19 --clock 4000,8000 --flash 0x08000000
+python Tools/read_timing.py --serial COM7 --probe network-probe-a1b2c3
 python Tools/read_timing.py --help
 ```
 
 ## Licensing
 
-The probe firmware is GPL-3.0-or-later (see `COPYING`), as it links Black Magic Debug. The NETWORK PROBE
-protocol header in `components/network_probe_proto` and the tools under `Tools/espnow_bench` are MIT.
+The probe firmware is GPL-3.0-or-later (see `COPYING`), as it links Black Magic Debug. The dongle firmware,
+the shared headers in `components/` and the tools under `Tools/` are MIT.
