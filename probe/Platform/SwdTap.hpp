@@ -27,18 +27,18 @@ class SwdTap
 	static void init();
 
 	/**
-	 * @brief Sets the SWCLK frequency, rounded so the clock never exceeds the request. At or above the measured maximum
-	 * the loop runs as fast as it can.
+	 * @brief Sets the SWCLK frequency, rounded so the clock never exceeds the request. A request at or above the maximum
+	 * gets the maximum.
 	 */
 	static void setFrequency(uint32_t frequency);
 
 	/**
-	 * @brief Gets the nominal SWCLK frequency derived from the half period setting.
+	 * @brief Gets the SWCLK frequency derived from the half period setting.
 	 */
 	static uint32_t getFrequency();
 
 	/**
-	 * @brief Gets the fastest SWCLK the loop can produce, measured at init.
+	 * @brief Gets the fastest SWCLK the tap times, from the speed of the loop measured at init.
 	 */
 	static uint32_t getMaxFrequency() { return maxFrequency; }
 
@@ -63,7 +63,7 @@ class SwdTap
 	static void turnaround(bool drive, uint32_t half);
 
 	/**
-	 * @brief Runs the output loop at full speed with both pins released.
+	 * @brief Runs the output loop at full speed with both pins released, a few times.
 	 * @return The fastest SWCLK the loop can produce, in Hz.
 	 */
 	static uint32_t calibrate();
@@ -74,8 +74,9 @@ class SwdTap
 	static inline uint32_t dioInMask = 0;
 
 	static inline uint32_t cpuFrequency = 0;
-	static inline uint32_t halfPeriod = 0;	 /**< CPU cycles per SWCLK half period, 0 = as fast as the loop runs. */
-	static inline uint32_t maxFrequency = 0; /**< Fastest SWCLK the loop can produce, measured at init. */
+	static inline uint32_t halfPeriod = 0;	  /**< CPU cycles per SWCLK half period, 0 until setFrequency(). */
+	static inline uint32_t minHalfPeriod = 1; /**< The shortest half period the loop keeps, from the measurement at init. */
+	static inline uint32_t maxFrequency = 0;  /**< SWCLK at minHalfPeriod. */
 	static inline bool swdioDriven = false;
 };
 

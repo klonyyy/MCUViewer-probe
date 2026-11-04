@@ -26,6 +26,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
 #include "hal/dedic_gpio_cpu_ll.h"
 #include "hal/gpio_ll.h"
 #include "sdkconfig.h"
@@ -43,6 +44,7 @@ constexpr int swclkGpio = CONFIG_NETWORK_PROBE_SWCLK_GPIO;
 constexpr int swdioGpio = CONFIG_NETWORK_PROBE_SWDIO_GPIO;
 
 constexpr size_t calibrationClocks = 256;
+constexpr int calibrationRuns = 8;
 
 constexpr const char* tag = "swd_tap";
 
@@ -181,10 +183,22 @@ void SwdTap::setDriveEnabled(const bool enable)
 
 uint32_t SwdTap::calibrate()
 {
-	const uint32_t start = esp_cpu_get_cycle_count();
-	seqOutRaw(0x55555555U, calibrationClocks, 0);
-	const uint32_t cycles = esp_cpu_get_cycle_count() - start;
-	return static_cast<uint32_t>(static_cast<uint64_t>(calibrationClocks) * cpuFrequency / cycles);
+	/*
+	 * Anything that holds this core up during a run makes the loop look slower than it is: an interrupt, or the other
+	 * core writing flash, which happens while Wi-Fi starts. Interrupts stay off during a run, which also defers the
+	 * other core's flash access, and the fastest run counts.
+	 */
+	uint32_t fewest = UINT32_MAX;
+	for (int run = 0; run < calibrationRuns; ++run)
+	{
+		portDISABLE_INTERRUPTS();
+		const uint32_t start = esp_cpu_get_cycle_count();
+		seqOutRaw(0x55555555U, calibrationClocks, 0);
+		const uint32_t cycles = esp_cpu_get_cycle_count() - start;
+		portENABLE_INTERRUPTS();
+		fewest = std::min(fewest, cycles);
+	}
+	return static_cast<uint32_t>(static_cast<uint64_t>(calibrationClocks) * cpuFrequency / fewest);
 }
 
 void SwdTap::init()
@@ -215,28 +229,24 @@ void SwdTap::init()
 	setDriveEnabled(false);
 
 	cpuFrequency = esp_rom_get_cpu_ticks_per_us() * 1000000U;
-	maxFrequency = calibrate();
+	/* The fastest clock that is still timed: the loop never runs free, so the clock is always the one reported */
+	const uint32_t loopFrequency = calibrate();
+	minHalfPeriod = std::max<uint32_t>(1, (cpuFrequency + 2U * loopFrequency - 1U) / (2U * loopFrequency));
+	maxFrequency = cpuFrequency / (2U * minHalfPeriod);
 	swdptap_init();
 
-	ESP_LOGI(tag, "SWCLK GPIO%d, SWDIO GPIO%d on core %d, max SWCLK %" PRIu32 " Hz", swclkGpio, swdioGpio, esp_cpu_get_core_id(), maxFrequency);
+	ESP_LOGI(tag, "SWCLK GPIO%d, SWDIO GPIO%d on core %d, max SWCLK %" PRIu32 " Hz (the loop runs at %" PRIu32 " Hz)", swclkGpio, swdioGpio, esp_cpu_get_core_id(), maxFrequency, loopFrequency);
 }
 
 void SwdTap::setFrequency(uint32_t frequency)
 {
-	if (frequency >= maxFrequency)
-	{
-		halfPeriod = 0;
-		return;
-	}
 	if (frequency < minFrequency)
 		frequency = minFrequency;
-	/* Round up, so the clock never exceeds the request */
-	halfPeriod = (cpuFrequency + 2U * frequency - 1U) / (2U * frequency);
+	/* Round up, so the clock never exceeds the request; at the shortest half period it is the maximum */
+	halfPeriod = std::max(minHalfPeriod, (cpuFrequency + 2U * frequency - 1U) / (2U * frequency));
 }
 
 uint32_t SwdTap::getFrequency()
 {
-	if (!halfPeriod)
-		return maxFrequency;
-	return std::min(cpuFrequency / (2U * halfPeriod), maxFrequency);
+	return halfPeriod ? cpuFrequency / (2U * halfPeriod) : maxFrequency;
 }
