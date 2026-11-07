@@ -22,7 +22,6 @@ namespace
 {
 constexpr const char* tag = "espnow_port";
 constexpr uint32_t poolSize = 12; /**< Packets the net task has not handled yet; more are dropped. */
-constexpr int window = 2;		  /**< Packets in flight: more do not go faster (Tools/espnow_bench). */
 constexpr size_t maxPeers = 4;	  /**< Dongles sent to lately; the one unused longest makes room. */
 /* 16-QAM: about 2 MB/s with a margin; the rates above come and go with the room (Tools/espnow_bench/RESULTS.md) */
 constexpr wifi_phy_mode_t linkMode = WIFI_PHY_MODE_HT20;
@@ -35,16 +34,29 @@ struct Peer
 	bool used;
 };
 
+/* The packet in the air: one at a time, so its send callback is known */
+enum class TxState : uint8_t
+{
+	idle,
+	inFlight,
+	failed, /**< No acknowledgement: service() sends it again. */
+};
+
 EspNowPort::Packet pool[poolSize];
 QueueHandle_t freeQueue = nullptr; /* Packet pointers */
 QueueHandle_t rxQueue = nullptr;
 int wakeFd = -1;
 std::atomic<bool> started{false};
 std::atomic<bool> running{false};
-std::atomic<int> inFlight{0};
+std::atomic<TxState> txState{TxState::idle};
 std::atomic<uint32_t> drops{0};
 uint32_t reportedDrops = 0;
+uint32_t lost = 0; /**< Packets sent maxResends times without an acknowledgement. */
+uint32_t reportedLost = 0;
 uint8_t txPacket[EspNowLink::maxPacket];
+size_t txLength = 0;
+uint8_t txMac[6];
+int txResends = 0;
 Peer peers[maxPeers];
 
 void wake()
@@ -74,8 +86,22 @@ void onReceive(const esp_now_recv_info_t* const info, const uint8_t* const data,
 
 void onSent(const esp_now_send_info_t* const info, const esp_now_send_status_t status)
 {
-	inFlight.fetch_sub(1, std::memory_order_relaxed);
+	txState = status == ESP_NOW_SEND_SUCCESS ? TxState::idle : TxState::failed;
 	wake();
+}
+
+/* The packet in txPacket, once more */
+bool transmit()
+{
+	txState = TxState::inFlight;
+	const esp_err_t result = esp_now_send(txMac, txPacket, txLength);
+	if (result == ESP_OK)
+		return true;
+	/* Out of buffers: the next service() round tries again */
+	txState = result == ESP_ERR_ESPNOW_NO_MEM ? TxState::failed : TxState::idle;
+	if (result != ESP_ERR_ESPNOW_NO_MEM)
+		ESP_LOGW(tag, "esp_now_send(): %s", esp_err_to_name(result));
+	return false;
 }
 
 bool init()
@@ -170,8 +196,8 @@ void EspNowPort::suspend()
 	if (!started || !running.exchange(false))
 		return;
 	esp_now_deinit();
-	/* The packets in flight get no callback any more */
-	inFlight = 0;
+	/* The packet in the air gets no callback any more */
+	txState = TxState::idle;
 }
 
 void EspNowPort::resume()
@@ -199,29 +225,47 @@ void EspNowPort::release(Packet* const packet)
 	xQueueSend(freeQueue, &packet, 0);
 }
 
-bool EspNowPort::canSend()
+void EspNowPort::service()
 {
-	return running && inFlight.load(std::memory_order_relaxed) < window;
+	if (lost != reportedLost)
+	{
+		ESP_LOGW(tag, "%" PRIu32 " packets lost so far: no acknowledgement after %d resends", lost, EspNowLink::maxResends);
+		reportedLost = lost;
+	}
+	if (!running || txState != TxState::failed)
+		return;
+	if (txResends == EspNowLink::maxResends)
+	{
+		lost++;
+		txState = TxState::idle;
+		return;
+	}
+	txResends++;
+	transmit();
 }
 
-EspNowPort::SendResult EspNowPort::send(const uint8_t* const mac, const EspNowLink::Kind kind, const uint16_t session, const uint8_t* const frame, const size_t length)
+bool EspNowPort::canSend()
+{
+	return running && txState == TxState::idle;
+}
+
+EspNowPort::SendResult EspNowPort::send(const uint8_t* const mac, const EspNowLink::Header& header, const uint8_t* const frame, const size_t length)
 {
 	if (!canSend())
 		return SendResult::busy;
 	if (length > EspNowLink::maxFrame || !addPeer(mac))
 		return SendResult::failed;
 
-	EspNowLink::encodeHeader(txPacket, kind, session);
+	EspNowLink::encodeHeader(txPacket, header);
 	if (length)
 		memcpy(txPacket + EspNowLink::headerSize, frame, length);
-	/* Before the send: its callback may come first */
-	inFlight.fetch_add(1, std::memory_order_relaxed);
-	const esp_err_t result = esp_now_send(mac, txPacket, EspNowLink::headerSize + length);
-	if (result == ESP_OK)
+	memcpy(txMac, mac, sizeof(txMac));
+	txLength = EspNowLink::headerSize + length;
+	txResends = 0;
+	if (transmit())
 		return SendResult::sent;
-	inFlight.fetch_sub(1, std::memory_order_relaxed);
-	if (result == ESP_ERR_ESPNOW_NO_MEM)
-		return SendResult::busy;
-	ESP_LOGW(tag, "esp_now_send(): %s", esp_err_to_name(result));
-	return SendResult::failed;
+	/* Not taken: the caller keeps the frame */
+	const bool full = txState == TxState::failed;
+	txState = TxState::idle;
+	return full ? SendResult::busy : SendResult::failed;
 }

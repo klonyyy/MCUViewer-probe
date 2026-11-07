@@ -158,7 +158,8 @@ constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a
  * IDENTIFY to the probes in range and passes their answers on. DONGLE_SELECT carries the id of a probe that answered
  * DISCOVER, as a string, and starts a session with it; the dongle answers it itself, OK or NO_PROBE. The frames after
  * it go to that probe, until the port closes or another DONGLE_SELECT; without a probe selected, the dongle answers
- * requests NO_PROBE. Max_payload is smaller than over TCP, as one frame travels in one ESP-NOW packet.
+ * requests NO_PROBE. Max_payload is smaller than over TCP, as one frame travels in one ESP-NOW packet. Right after
+ * opening the port, a host may get the tail of a frame sent before; it skips bytes until a frame checks out.
  */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */

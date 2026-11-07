@@ -139,6 +139,7 @@ void NetServer::run()
 	{
 		serviceLink();
 		swo->poll();
+		EspNowPort::service();
 		serviceEspNow();
 		if (hasClient() && !pumpTx())
 			closeClient();
@@ -268,7 +269,7 @@ void NetServer::closeClient(const bool tellPeer)
 	{
 		/* Best effort: a dongle that misses it finds out by its next frames going unanswered */
 		if (tellPeer)
-			EspNowPort::send(espnowPeer, EspNowLink::Kind::CLOSE, espnowSession, nullptr, 0);
+			EspNowPort::send(espnowPeer, {EspNowLink::Kind::CLOSE, espnowSession, 0, 0}, nullptr, 0);
 		memcpy(endedPeer, espnowPeer, sizeof(endedPeer));
 		endedSession = espnowSession;
 		ESP_LOGI(tag, "ESP-NOW session %u ended", espnowSession);
@@ -396,7 +397,10 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 		return;
 	const bool current = client == Client::espnow && linkHeader.session == espnowSession && !memcmp(packet.mac, espnowPeer, sizeof(espnowPeer));
 	if (current)
+	{
 		espnowLastRx = esp_timer_get_time();
+		espnowLimit = linkHeader.limit;
+	}
 
 	if (linkHeader.kind == EspNowLink::Kind::PING)
 		return;
@@ -421,24 +425,31 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 		const size_t length = answerDiscovery(header, payload);
 		if (length)
 		{
-			/* With the window full the answer is dropped, and the host asks again */
-			EspNowPort::send(packet.mac, EspNowLink::Kind::DATA, EspNowLink::noSession, discoveryFrame.data(), length);
+			/* With a packet in the air the answer is dropped, and the host asks again */
+			EspNowPort::send(packet.mac, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0}, discoveryFrame.data(), length);
 			if (header.type == NetworkProbe::Type::IDENTIFY)
 				ESP_LOGI(tag, "identifying, as " MACSTR " asked", MAC2STR(packet.mac));
 		}
 		return;
 	}
-	if (!current)
+	if (current)
+	{
+		/* A resend whose first copy came through */
+		if (linkHeader.seq == espnowRxSeq)
+			return;
+		espnowRxSeq = linkHeader.seq;
+	}
+	else
 	{
 		if (linkHeader.session == endedSession && !memcmp(packet.mac, endedPeer, sizeof(endedPeer)))
 			return;
-		openEspNowSession(packet.mac, linkHeader.session);
+		openEspNowSession(packet.mac, linkHeader);
 	}
 	if (!handleFrame(header, payload))
 		closeClient();
 }
 
-void NetServer::openEspNowSession(const uint8_t* const mac, const uint16_t session)
+void NetServer::openEspNowSession(const uint8_t* const mac, const EspNowLink::Header& linkHeader)
 {
 	if (hasClient())
 	{
@@ -446,7 +457,11 @@ void NetServer::openEspNowSession(const uint8_t* const mac, const uint16_t sessi
 		closeClient();
 	}
 	memcpy(espnowPeer, mac, sizeof(espnowPeer));
+	const uint16_t session = linkHeader.session;
 	espnowSession = session;
+	espnowRxSeq = linkHeader.seq;
+	espnowTxSeq = 1;
+	espnowLimit = linkHeader.limit;
 	espnowLastRx = esp_timer_get_time();
 	ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected, session %u", MAC2STR(mac), session);
 	startSession(Client::espnow, EspNowLink::maxPayload);
@@ -659,8 +674,8 @@ bool NetServer::pumpTx()
 	{
 		if (txSent == txLength)
 		{
-			/* A packet carries a whole frame: take the next one only while the ESP-NOW window has room */
-			if (client == Client::espnow && !EspNowPort::canSend())
+			/* A packet carries a whole frame: take the next one only once it can go, and the dongle has room for it */
+			if (client == Client::espnow && (!EspNowPort::canSend() || !EspNowLink::allows(espnowLimit, espnowTxSeq)))
 				return true;
 			if (!nextFrame(now))
 				return true;
@@ -670,11 +685,12 @@ bool NetServer::pumpTx()
 		if (client == Client::espnow)
 		{
 			/* Busy keeps the frame for when a send callback, or the next select() timeout, wakes the task */
-			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, EspNowLink::Kind::DATA, espnowSession, txFrame.data(), txLength);
+			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, {EspNowLink::Kind::DATA, espnowSession, espnowTxSeq, 0}, txFrame.data(), txLength);
 			if (result == EspNowPort::SendResult::busy)
 				return true;
 			if (result == EspNowPort::SendResult::failed)
 				return false;
+			espnowTxSeq++;
 			txSent = txLength;
 			continue;
 		}

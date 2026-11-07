@@ -29,6 +29,7 @@ import zlib
 PROTOCOL = 1
 PORT = 2023
 MAGIC = 0x564D
+MAX_DONGLE_PAYLOAD = 1450  # one frame per ESP-NOW packet
 
 HELLO, CONNECT, DISCONNECT, READ, READ_LIST, DISCOVER = 0x01, 0x02, 0x03, 0x04, 0x06, 0x09
 SET_PLAN, START, STOP, READ_BULK = 0x10, 0x11, 0x12, 0x15
@@ -136,6 +137,8 @@ class SerialLink:
 class Probe:
     def __init__(self, link):
         self.link = link
+        # A serial port may hand over the tail of a frame sent before it was opened: look for the next frame there
+        self.resync = isinstance(link, SerialLink)
         self.seq = 0
         self.rx = bytearray()
         self.on_data = None
@@ -150,13 +153,19 @@ class Probe:
         while True:
             if len(self.rx) >= 8:
                 magic, version, frame_type, length, seq = struct.unpack_from("<HBBHH", self.rx)
-                if magic != MAGIC or version != 1:
-                    raise ProbeError("corrupt stream")
+                if magic != MAGIC or version != 1 or (self.resync and length > MAX_DONGLE_PAYLOAD):
+                    if not self.resync:
+                        raise ProbeError("corrupt stream")
+                    del self.rx[0]
+                    continue
                 if len(self.rx) >= 12 + length:
                     whole = bytes(self.rx[:12 + length])
-                    del self.rx[:12 + length]
                     if struct.unpack_from("<I", whole, 8 + length)[0] != zlib.crc32(whole[:8 + length]) & 0xFFFFFFFF:
-                        raise ProbeError("CRC mismatch")
+                        if not self.resync:
+                            raise ProbeError("CRC mismatch")
+                        del self.rx[0]
+                        continue
+                    del self.rx[:12 + length]
                     return frame_type, seq, whole[8:8 + length]
             left = end - time.monotonic()
             if left <= 0:

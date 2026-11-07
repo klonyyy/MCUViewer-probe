@@ -29,7 +29,8 @@ class Wifi;
  * ESP-NOW window only fills the ring.
  *
  * ESP-NOW: each packet carries one frame, so an ESP-NOW session announces a smaller max_payload and max_read in HELLO,
- * and READ_BULK chunks shrink to match. Sessions follow EspNowLink: they end with CLOSE or after a silence.
+ * and READ_BULK chunks shrink to match. Sessions follow EspNowLink: they end with CLOSE or after a silence, resends are
+ * dropped by their seq, and a frame goes only while the dongle's limit allows it, as over TCP while the window does.
  *
  * SWO needs no SWD, so the net task owns the SWO capture: it answers SWO_START and SWO_STOP itself, and sends the
  * captured bytes in SWO_DATA frames, taking turns with DATA.
@@ -97,7 +98,7 @@ class NetServer
 	 */
 	void serviceEspNow();
 	void handlePacket(const EspNowPort::Packet& packet);
-	void openEspNowSession(const uint8_t* mac, uint16_t session);
+	void openEspNowSession(const uint8_t* mac, const EspNowLink::Header& linkHeader);
 
 	/**
 	 * @brief Checks that data holds exactly one frame, with a valid CRC.
@@ -215,6 +216,9 @@ class NetServer
 	/* The ESP-NOW client, and the last ESP-NOW session that ended, whose packets are dropped */
 	uint8_t espnowPeer[6] = {};
 	uint16_t espnowSession = EspNowLink::noSession;
+	uint16_t espnowTxSeq = 1; /**< seq of the next DATA sent. */
+	uint16_t espnowRxSeq = 0; /**< seq of the last DATA taken. */
+	uint16_t espnowLimit = 0; /**< The dongle's: the last seq it has room for. */
 	int64_t espnowLastRx = 0;
 	uint8_t endedPeer[6] = {};
 	uint16_t endedSession = EspNowLink::noSession;

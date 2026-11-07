@@ -55,11 +55,18 @@ python Tools/read_timing.py --serial COM7 --probe network-probe-a1b2c3
 
 It discovers the probes the dongle hears, selects one and runs its tests through it.
 
+## Delivery
+
+Both sides keep one packet in the air and send it again while the radio gets no acknowledgement for it, up to ten
+times; a resend whose first copy came through is dropped by its number. The dongle tells the probe how much more it
+has room for, so a host that reads slowly holds the probe back, as a full TCP window does: frames are not lost, the
+probe's sample buffer fills instead and reports an overflow. When the probe stops acknowledging for 2 s, the dongle
+ends the session and flashes red; requests get `NO_PROBE` from then on.
+
 ## Limits for now
 
 - Fixed channel, see above.
 - No encryption or pairing: any dongle in range can talk to the probe, like any host on the network over TCP.
-- No retransmission: a request or an answer lost on the air shows as a timeout on the host. Losses at a good
-  signal are rare, see [the bench results](../Tools/espnow_bench/RESULTS.md).
-- USB full speed limits the dongle to about 1 MB/s, and there is no flow control yet: when the probe sends faster
-  than that for long, the dongle drops frames, and the host sees gaps or a failed READ_BULK.
+- A packet that fails ten times is lost: a lost request or answer shows as a timeout on the host. At a usable signal
+  that is rare, see [the bench results](../Tools/espnow_bench/RESULTS.md).
+- USB full speed limits the dongle to about 1 MB/s.
