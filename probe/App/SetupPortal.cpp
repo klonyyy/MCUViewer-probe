@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "Wifi.hpp"
@@ -54,13 +55,17 @@ h2{font-size:1rem;margin:0}
 .bars i{width:4px;background:var(--line);border-radius:1px}
 .bars i.on{background:var(--fg)}
 label{display:block;margin:14px 0 4px;color:var(--muted);font-size:.9rem}
-input[type=text],input[type=password]{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+input[type=text],input[type=password],select{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+select:disabled{opacity:.5}
 .check{display:flex;align-items:center;gap:6px;margin-top:6px}
 .check label{margin:0}
 .hint{margin:6px 0 0;color:var(--muted);font-size:.85rem}
 code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
-#join{width:100%;margin-top:18px;padding:12px;border:0;border-radius:8px;background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
-#join:disabled{opacity:.5}
+#join,#save{width:100%;margin-top:18px;padding:12px;border:0;border-radius:8px;background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+#join:disabled,#save:disabled{opacity:.5}
+#saved{margin:10px 0 0;font-size:.9rem}
+#saved.ok{color:var(--ok)}
+#saved.bad{color:var(--bad)}
 </style>
 </head>
 <body>
@@ -81,6 +86,16 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
 <p class="hint">MCUViewer and GDB reach the probe at <code id="fqdn"></code></p>
 <button id="join" type="button">Connect</button>
 </div>
+<div class="card">
+<h2>ESP-NOW dongle</h2>
+<div class="check"><input type="checkbox" id="espnow"><label for="espnow">ESP-NOW dongles may reach the probe</label></div>
+<div class="check"><input type="checkbox" id="field"><label for="field">Field mode: no Wi-Fi network, ESP-NOW only</label></div>
+<label for="chan">Field mode channel</label>
+<select id="chan"></select>
+<p class="hint">In field mode the probe joins no network and keeps its radio on this channel, so a dongle finds it at any time. With several probes in field mode, give each its own channel: 1, 6 or 11. To leave field mode, hold the BOOT button for 3 seconds; the saved networks stay.</p>
+<button id="save" type="button">Save</button>
+<p id="saved"></p>
+</div>
 </main>
 <script>
 "use strict";
@@ -89,6 +104,7 @@ const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 let last = null;
 let deviceId = "";
 let joined = false;
+let restarting = false;
 let missed = 0;
 
 async function get(url) {
@@ -199,6 +215,18 @@ function showHost() {
   $("fqdn").textContent = ($("host").value.trim().toLowerCase() || deviceId) + ".local";
 }
 
+// Field mode needs ESP-NOW, and the channel matters only in field mode
+function syncRadio() {
+  if (!$("espnow").checked) $("field").checked = false;
+  $("field").disabled = !$("espnow").checked;
+  $("chan").disabled = !$("field").checked;
+}
+
+function showSaved(kind, text) {
+  $("saved").className = kind;
+  $("saved").textContent = text;
+}
+
 async function poll() {
   for (;;) {
     try {
@@ -210,12 +238,18 @@ async function poll() {
         $("host").value = status.hostname;
         $("host").placeholder = status.id;
         showHost();
+        $("espnow").checked = status.espnow;
+        $("field").checked = status.field;
+        $("chan").value = String(status.channel);
+        syncRadio();
       }
       last = status;
       showStatus(status);
     } catch (error) {
       if (++missed === 3 && last) {
-        if (joined || last.state === "connected") {
+        if (restarting) {
+          say("", "The probe restarted in field mode and closed this setup network. A dongle finds it on channel " + $("chan").value + ".");
+        } else if (joined || last.state === "connected") {
           say("", ["The probe stopped answering: it has probably joined " + last.ssid + " and closed this setup network. Connect this device back to your network and use ", {code: last.hostname + ".local"}, "."]);
         } else {
           say("bad", "The probe does not answer. Is this device still connected to " + last.id + "?");
@@ -243,6 +277,28 @@ $("join").onclick = async () => {
   }
   $("join").disabled = false;
 };
+$("save").onclick = async () => {
+  const form = new URLSearchParams({espnow: $("espnow").checked ? "1" : "0", field: $("field").checked ? "1" : "0", channel: $("chan").value});
+  $("save").disabled = true;
+  try {
+    const response = await fetch("/radio", {method: "POST", body: form});
+    const text = await response.text();
+    if (!response.ok) {
+      showSaved("bad", text);
+    } else if (text === "restart") {
+      restarting = true;
+      showSaved("ok", "Saved. The probe restarts in field mode now and closes this setup network.");
+    } else {
+      showSaved("ok", "Saved.");
+    }
+  } catch (error) {
+    showSaved("bad", "The probe did not answer. Try again.");
+  }
+  $("save").disabled = false;
+};
+for (let channel = 1; channel <= 11; channel++) $("chan").add(new Option(String(channel), String(channel)));
+$("espnow").onchange = syncRadio;
+$("field").onchange = syncRadio;
 $("show").onchange = () => { $("pass").type = $("show").checked ? "text" : "password"; };
 $("pass").onkeydown = (event) => { if (event.key === "Enter") $("join").click(); };
 $("host").oninput = showHost;
@@ -372,6 +428,51 @@ const char* readJoinForm(char* const form, NetworkSettings& settings)
 	return nullptr;
 }
 
+/* Reads the radio form of the setup page over the settings it holds. Returns an error for the page, or nullptr. */
+const char* readRadioForm(char* const form, RadioSettings& settings)
+{
+	char* save = nullptr;
+	for (char* pair = strtok_r(form, "&", &save); pair; pair = strtok_r(nullptr, "&", &save))
+	{
+		char* const separator = strchr(pair, '=');
+		if (!separator)
+			continue;
+		*separator = '\0';
+		const char* const value = separator + 1;
+		if (!strcmp(pair, "espnow"))
+			settings.espNow = !strcmp(value, "1");
+		else if (!strcmp(pair, "field"))
+			settings.fieldMode = !strcmp(value, "1");
+		else if (!strcmp(pair, "channel"))
+		{
+			char* end = nullptr;
+			const long channel = strtol(value, &end, 10);
+			if (!value[0] || *end || channel < 0 || channel > UINT8_MAX)
+				return "The channel could not be read.";
+			settings.fieldChannel = static_cast<uint8_t>(channel);
+		}
+	}
+	return nullptr;
+}
+
+/* The request body into form, terminated. False if it is too long, or the connection broke. */
+bool receiveForm(httpd_req_t* const request, char* const form, const size_t size, bool& tooLong)
+{
+	tooLong = request->content_len >= size;
+	if (tooLong)
+		return false;
+	size_t received = 0;
+	while (received < request->content_len)
+	{
+		const int length = httpd_req_recv(request, form + received, request->content_len - received);
+		if (length <= 0)
+			return false;
+		received += static_cast<size_t>(length);
+	}
+	form[received] = '\0';
+	return true;
+}
+
 esp_err_t sendJson(httpd_req_t* const request, const char* const json)
 {
 	httpd_resp_set_type(request, "application/json");
@@ -423,6 +524,7 @@ void SetupPortal::start(esp_netif_t* const apNetif)
 		add("/status", HTTP_GET, handleStatus);
 		add("/scan", HTTP_GET, handleScan);
 		add("/join", HTTP_POST, handleJoin);
+		add("/radio", HTTP_POST, handleRadio);
 		httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, redirect);
 	}
 	else
@@ -484,7 +586,8 @@ esp_err_t SetupPortal::handleStatus(httpd_req_t* const request)
 	out = putJsonString(out, end, status.ip);
 	out = putText(out, end, ",\"error\":");
 	out = putJsonString(out, end, status.error);
-	snprintf(out, end - out, ",\"port\":%d}", CONFIG_NETWORK_PROBE_PORT);
+	const RadioSettings radio = wifi.getRadio();
+	snprintf(out, end - out, ",\"espnow\":%s,\"field\":%s,\"channel\":%u,\"port\":%d}", radio.espNow ? "true" : "false", radio.fieldMode ? "true" : "false", radio.fieldChannel, CONFIG_NETWORK_PROBE_PORT);
 	return sendJson(request, json);
 }
 
@@ -520,17 +623,9 @@ esp_err_t SetupPortal::handleJoin(httpd_req_t* const request)
 {
 	Wifi& wifi = of(request).wifi;
 	char form[maxFormSize];
-	if (request->content_len >= sizeof(form))
-		return sendError(request, "The form is too long.");
-	size_t received = 0;
-	while (received < request->content_len)
-	{
-		const int length = httpd_req_recv(request, form + received, request->content_len - received);
-		if (length <= 0)
-			return ESP_FAIL;
-		received += static_cast<size_t>(length);
-	}
-	form[received] = '\0';
+	bool tooLong = false;
+	if (!receiveForm(request, form, sizeof(form), tooLong))
+		return tooLong ? sendError(request, "The form is too long.") : ESP_FAIL;
 
 	NetworkSettings settings;
 	const char* error = readJoinForm(form, settings);
@@ -549,6 +644,25 @@ esp_err_t SetupPortal::handleJoin(httpd_req_t* const request)
 	wifi.join(settings);
 	httpd_resp_set_type(request, "text/plain");
 	return httpd_resp_sendstr(request, "OK");
+}
+
+esp_err_t SetupPortal::handleRadio(httpd_req_t* const request)
+{
+	Wifi& wifi = of(request).wifi;
+	char form[maxFormSize];
+	bool tooLong = false;
+	if (!receiveForm(request, form, sizeof(form), tooLong))
+		return tooLong ? sendError(request, "The form is too long.") : ESP_FAIL;
+
+	RadioSettings settings = wifi.getRadio();
+	bool restarting = false;
+	const char* error = readRadioForm(form, settings);
+	if (!error)
+		error = wifi.setRadio(settings, restarting);
+	if (error)
+		return sendError(request, error);
+	httpd_resp_set_type(request, "text/plain");
+	return httpd_resp_sendstr(request, restarting ? "restart" : "saved");
 }
 
 esp_err_t SetupPortal::redirect(httpd_req_t* const request, httpd_err_code_t)

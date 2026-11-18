@@ -12,13 +12,14 @@
  * @brief The status LED: a WS2812 RGB LED, driven by RMT.
  *
  * It shows the first of these that applies:
- * - the setup button held: white blinks that speed up until the saved networks are forgotten;
+ * - the setup button held: white blinks that speed up until the saved networks are forgotten, or field mode left;
  * - identification: fast white blinks for a few seconds, when a host asked which probe this is;
  * - an alert: one amber flash when samples or SWO bytes were dropped, one red flash when an access to the target
  *   failed, red blinks when the target was lost or a Wi-Fi join failed;
  * - a GDB session: orange, dipping briefly for the packets;
  * - an MCUViewer session: cyan, dipping briefly for the frames sent, so streaming flickers evenly;
- * - the network: blue blinks while joining, purple breathing in setup mode, slow green breathing once online.
+ * - the network: blue blinks while joining, purple breathing in setup mode, slow green breathing once online, slow
+ *   blue breathing in field mode.
  *
  * The other modules only record what happened, from any task; the LED task on core 0 renders it 50 times a second.
  * There is one LED, so the class is a set of static functions.
@@ -31,6 +32,7 @@ class StatusLed
 		connecting, /**< Joining a network, no address yet. */
 		setup,		/**< Setup mode: the access point is up. */
 		online,		/**< The station has an address. */
+		field,		/**< Field mode: no network, ESP-NOW alone. */
 	};
 
 	/**

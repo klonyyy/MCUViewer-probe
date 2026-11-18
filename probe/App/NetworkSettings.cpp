@@ -18,6 +18,7 @@ namespace
 {
 constexpr const char* tag = "settings";
 constexpr const char* nvsNamespace = "network";
+constexpr const char* radioNamespace = "radio"; /**< Apart: SavedNetworks::erase() empties its namespace. */
 
 bool getString(const nvs_handle_t handle, const char* const key, char* const out, const size_t size)
 {
@@ -147,6 +148,48 @@ void SavedNetworks::erase()
 		ESP_LOGE(tag, "erasing the network settings failed");
 	nvs_close(handle);
 }
+
+const char* RadioSettings::validate() const
+{
+	if (fieldChannel < minChannel || fieldChannel > maxChannel)
+		return "The field mode channel is 1 to 11.";
+	if (fieldMode && !espNow)
+		return "Field mode needs ESP-NOW: a dongle is the only way to reach the probe in it.";
+	return nullptr;
+}
+
+void RadioSettings::load()
+{
+	*this = RadioSettings{};
+	fieldChannel = CONFIG_NETWORK_PROBE_AP_CHANNEL >= minChannel && CONFIG_NETWORK_PROBE_AP_CHANNEL <= maxChannel ? CONFIG_NETWORK_PROBE_AP_CHANNEL : minChannel;
+
+	nvs_handle_t handle;
+	if (nvs_open(radioNamespace, NVS_READONLY, &handle) != ESP_OK)
+		return;
+	uint8_t value = 0;
+	if (nvs_get_u8(handle, "espnow", &value) == ESP_OK)
+		espNow = value != 0;
+	if (nvs_get_u8(handle, "field", &value) == ESP_OK)
+		fieldMode = value != 0;
+	if (nvs_get_u8(handle, "channel", &value) == ESP_OK && value >= minChannel && value <= maxChannel)
+		fieldChannel = value;
+	nvs_close(handle);
+	/* Settings that cannot be used, written by hand: the probe stays reachable */
+	if (fieldMode && !espNow)
+		fieldMode = false;
+}
+
+bool RadioSettings::save() const
+{
+	nvs_handle_t handle;
+	if (nvs_open(radioNamespace, NVS_READWRITE, &handle) != ESP_OK)
+		return false;
+	const bool written = nvs_set_u8(handle, "espnow", espNow ? 1 : 0) == ESP_OK && nvs_set_u8(handle, "field", fieldMode ? 1 : 0) == ESP_OK &&
+						 nvs_set_u8(handle, "channel", fieldChannel) == ESP_OK && nvs_commit(handle) == ESP_OK;
+	nvs_close(handle);
+	return written;
+}
+
 const char* NetworkSettings::validate() const
 {
 	if (!ssid[0])

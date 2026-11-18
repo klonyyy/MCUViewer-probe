@@ -46,6 +46,7 @@ order.
 | blue, short blinks | joining the Wi-Fi network |
 | purple, breathing | setup mode: the access point is up |
 | green, slow breathing | on the network, no client |
+| blue, slow breathing | field mode: no network, ESP-NOW only, no client |
 | cyan | MCUViewer connected; it dips briefly for the frames sent, so streaming flickers evenly |
 | orange | GDB session; it dips briefly for the packets |
 | one amber flash | samples or SWO bytes were dropped (buffer overflow) |
@@ -109,8 +110,23 @@ over it, at 192.168.4.1.
 
 To forget all saved networks, hold the BOOT button (GPIO0, see
 `CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO`) for 3 s while the probe runs. It restarts in setup
-mode, or joins the default network if one is built in. Do not hold BOOT while powering up: that
-starts the ESP32-S3's download mode.
+mode, or joins the default network if one is built in. In field mode the same hold leaves field
+mode instead, see below. Do not hold BOOT while powering up: that starts the ESP32-S3's download
+mode.
+
+### Field mode
+
+Where there is no network, such as on a robot out in the field, the probe can do without one: an
+[ESP-NOW dongle](dongle/README.md) reaches it directly. On the setup page, under *ESP-NOW dongle*,
+check *Field mode*, pick a channel and save. The probe restarts, joins no network and looks for
+none, and keeps its radio on that channel, so a dongle finds it at any time. Several probes in
+field mode work side by side; give each its own channel, 1, 6 or 11, so they do not share
+airtime. Field mode has no access point either: to leave it, hold the BOOT button for 3 s, and
+the probe restarts as before, with its saved networks.
+
+The setup page is there in setup mode: out where no saved network is in reach, the probe opens it
+by itself 15 s after starting. The same section of the page turns ESP-NOW off, so that no dongle
+reaches the probe; field mode needs it on.
 
 The setup access point is open unless `CONFIG_NETWORK_PROBE_AP_PASSWORD` is set (at least 8
 characters).

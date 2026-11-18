@@ -37,6 +37,10 @@
  * as either takes the radio off the session's channel, and an attempt under way stops. What was due waits until
  * releaseDelayMs after the session. Joins and scans from the setup page still go ahead: someone asked for them.
  *
+ * Field mode (RadioSettings), chosen on the setup page, takes effect at the next start: the station starts but joins
+ * nothing and scans for nothing, and its radio stays on the field channel for ESP-NOW alone; there is no access point
+ * either. Holding the setup button leaves field mode and keeps the saved networks; out of field mode it forgets them.
+ *
  * The Wi-Fi task owns all of it: the Wi-Fi events and the setup page only queue commands for it, the setup button and
  * the timeouts are polled by it.
  */
@@ -117,6 +121,21 @@ class Wifi
 	 */
 	bool isRoaming() const { return roaming.load(std::memory_order_relaxed); }
 
+	/**
+	 * @brief Whether dongles may reach the probe, see RadioSettings. Callable from any task.
+	 */
+	bool isEspNowEnabled() const { return espNowEnabled.load(std::memory_order_relaxed); }
+
+	RadioSettings getRadio();
+
+	/**
+	 * @brief The setup page: saves the radio settings. ESP-NOW is turned on or off at once; field mode needs a restart,
+	 * which follows a moment later, so the page gets its answer first.
+	 * @param restarting Set when the probe restarts into field mode.
+	 * @return Why the settings were not saved, or nullptr.
+	 */
+	const char* setRadio(const RadioSettings& settings, bool& restarting);
+
 	const char* getDeviceId() const { return deviceId; }
 
 	/**
@@ -142,6 +161,7 @@ class Wifi
 	static constexpr uint32_t setupCloseMs = 60000;	   /**< The access point stays this long after the station got an address. */
 	static constexpr uint32_t joinTimeoutMs = 45000;
 	static constexpr uint8_t maxJoinAttempts = 3; /**< A wrong password ends the join at the first one. */
+	static constexpr uint32_t restartDelayMs = 1000; /**< After the setup page turned field mode on: its answer goes first. */
 	static constexpr uint32_t buttonPollMs = 100;
 	static constexpr uint32_t buttonHoldMs = 3000;
 	static constexpr uint16_t maxScanRecords = 32;
@@ -156,6 +176,7 @@ class Wifi
 		join, /**< The settings are in requested. */
 		scan,
 		radioHold, /**< value: the channel of the ESP-NOW session, 0 when it ended. */
+		restart,   /**< Into field mode, after restartDelayMs. */
 	};
 
 	struct Message
@@ -190,6 +211,11 @@ class Wifi
 	TickType_t ticksUntilDeadline() const;
 
 	void boot();
+
+	/**
+	 * @brief Starts field mode: the station without a network, its radio on the field channel.
+	 */
+	void startField();
 	void enterSetup();
 	void leaveSetup();
 
@@ -216,7 +242,8 @@ class Wifi
 	void deferToRelease();
 
 	/**
-	 * @brief Puts the idle station's radio on the channel a dongle finds it on: the session's, else the last network's.
+	 * @brief Puts the idle station's radio on the channel a dongle finds it on: the field channel in field mode, else the
+	 * session's, else the last network's.
 	 */
 	void parkRadio();
 	void onRadioHold(uint8_t channel);
@@ -250,6 +277,8 @@ class Wifi
 	size_t orderCount = 0;
 	size_t orderNext = 0;
 	bool wifiStarted = false;
+	bool fieldMode = false;	  /**< Since the start: changes take a restart. */
+	uint8_t fieldChannel = 0;
 	bool setupMode = false;
 	bool staBusy = false;	/**< Connecting or connected: another connection needs a disconnection first. */
 	bool staLinked = false; /**< Associated, maybe without an address yet. */
@@ -265,16 +294,19 @@ class Wifi
 	bool retryOnRelease = false;
 	std::atomic<bool> roaming{false};
 	std::atomic<bool> ownScan{false}; /**< A scan for connectSaved(), which a hold stops. */
+	std::atomic<bool> espNowEnabled{true};
 	int64_t buttonPressedAt = 0;
 	Deadline bootDeadline;
 	Deadline retryDeadline;
 	Deadline joinDeadline;
 	Deadline closeDeadline;
 	Deadline buttonDeadline;
+	Deadline restartDeadline;
 
 	/* Shared with the setup page, and activeHostname with the net task */
 	std::mutex statusLock;
 	Status status;
+	RadioSettings radio; /**< As saved: field mode as it will be at the next start. */
 	char activeHostname[NetworkSettings::maxHostnameLength + 1] = {}; /**< Written only by applyHostname(). */
 	NetworkSettings requested; /**< The join from the setup page, for the Wi-Fi task. */
 	Network networks[maxNetworks] = {};

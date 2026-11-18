@@ -238,6 +238,8 @@ Look networkLook(const int64_t nowMs)
 			return {blue, blink(nowMs, 100, 500)};
 		case StatusLed::Network::setup:
 			return {purple, breathing(nowMs, 2000, 0.1f)};
+		case StatusLed::Network::field:
+			return {blue, breathing(nowMs, 4000, 0.15f)};
 		case StatusLed::Network::online:
 			break;
 	}

@@ -40,7 +40,8 @@ more: the reset at the end of the flash leaves a board started with BOOT in down
 ## Channels
 
 ESP-NOW talks on one Wi-Fi channel, and a probe is on the channel its radio is on: the channel of the network it
-joined, or in setup mode the channel of its access point, 6 by default. The dongle finds it: a DISCOVER from the
+joined, in setup mode the channel of its access point, 6 by default, and in field mode, without a network, the channel
+set for it on its setup page (see [field mode](../README.md#field-mode)). The dongle finds it: a DISCOVER from the
 host goes out on every channel in turn, which takes about half a second, and each probe's answer tells its channel.
 A session then stays on that channel, and while it lasts the probe neither scans for networks nor connects to one by
 itself, as both take its radio off the channel. A probe whose network is out of reach rests on the channel of that

@@ -22,7 +22,8 @@ class Wifi;
  * themselves; any other address redirects to it.
  *
  * The page lists the networks in range, sends the chosen one with its password and the hostname, and polls the status
- * to show how joining went. Its requests never wait for the Wi-Fi task.
+ * to show how joining went. It also sets how dongles reach the probe (RadioSettings): ESP-NOW on or off, and field
+ * mode, which restarts the probe. Its requests never wait for the Wi-Fi task.
  */
 class SetupPortal
 {
@@ -54,6 +55,7 @@ class SetupPortal
 	static esp_err_t handleStatus(httpd_req_t* request);
 	static esp_err_t handleScan(httpd_req_t* request);
 	static esp_err_t handleJoin(httpd_req_t* request);
+	static esp_err_t handleRadio(httpd_req_t* request);
 	static esp_err_t redirect(httpd_req_t* request, httpd_err_code_t error);
 
 	static void dnsTaskEntry(void* arg);

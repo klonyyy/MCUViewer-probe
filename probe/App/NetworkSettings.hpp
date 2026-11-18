@@ -7,6 +7,7 @@
 #define NETWORKSETTINGS_HPP
 
 #include <stddef.h>
+#include <stdint.h>
 
 /**
  * @brief One network the probe joins, and the hostname to use on it.
@@ -70,6 +71,36 @@ struct SavedNetworks
 
    private:
 	bool defaultOnly = false; /**< The only entry is the Kconfig default, not in NVS. */
+};
+
+/**
+ * @brief How dongles reach the probe, set on the setup page and kept in NVS apart from the networks, so forgetting
+ * those keeps it. In field mode the probe joins no network and looks for none: its radio stays on fieldChannel for
+ * ESP-NOW alone, so a dongle finds it there at any time. Field mode takes effect at the next start.
+ */
+struct RadioSettings
+{
+	static constexpr uint8_t minChannel = 1;
+	static constexpr uint8_t maxChannel = 11; /**< What a dongle sweeps with its default country. */
+
+	bool espNow = true; /**< Dongles may reach the probe: it answers their DISCOVER and serves their sessions. */
+	bool fieldMode = false;
+	uint8_t fieldChannel = 0;
+
+	/**
+	 * @return Why the settings cannot be used, or nullptr if they can. The text is shown on the setup page.
+	 */
+	const char* validate() const;
+
+	/**
+	 * @brief Loads the settings, or the defaults: ESP-NOW on, no field mode, the setup access point's channel.
+	 */
+	void load();
+
+	/**
+	 * @return False if NVS could not be written.
+	 */
+	bool save() const;
 };
 
 #endif /* NETWORKSETTINGS_HPP */

@@ -66,6 +66,12 @@ void Wifi::start()
 	queue = xQueueCreate(queueLength, sizeof(Message));
 	NetworkSettings::getDeviceId(deviceId, sizeof(deviceId));
 	saved.load();
+	radio.load();
+	fieldMode = radio.fieldMode;
+	fieldChannel = radio.fieldChannel;
+	espNowEnabled = radio.espNow;
+	if (!radio.espNow)
+		ESP_LOGI(tag, "ESP-NOW is off: dongles do not reach the probe");
 	{
 		std::lock_guard<std::mutex> lock(statusLock);
 		strlcpy(status.hostname, saved.hostname, sizeof(status.hostname));
@@ -128,6 +134,36 @@ void Wifi::requestScan(const bool force)
 	post(Command::scan);
 }
 
+RadioSettings Wifi::getRadio()
+{
+	std::lock_guard<std::mutex> lock(statusLock);
+	return radio;
+}
+
+const char* Wifi::setRadio(const RadioSettings& settings, bool& restarting)
+{
+	restarting = false;
+	const char* const error = settings.validate();
+	if (error)
+		return error;
+	if (!settings.save())
+		return "The settings could not be saved.";
+	{
+		std::lock_guard<std::mutex> lock(statusLock);
+		radio = settings;
+	}
+	espNowEnabled = settings.espNow;
+	ESP_LOGI(tag, "ESP-NOW %s, field mode %s, field channel %u", settings.espNow ? "on" : "off", settings.fieldMode ? "on" : "off", settings.fieldChannel);
+
+	/* The page is there only out of field mode: field mode on means a restart into it */
+	if (settings.fieldMode && !fieldMode)
+	{
+		restarting = true;
+		post(Command::restart);
+	}
+	return nullptr;
+}
+
 void Wifi::holdRadio(const uint8_t channel)
 {
 	/* The Wi-Fi task waits in it, and would see the hold only after it */
@@ -184,7 +220,10 @@ void Wifi::run()
 	while (true)
 	{
 		/* A join from the setup page shows as connecting, though the access point stays up */
-		StatusLed::setNetwork(hasIp ? StatusLed::Network::online : (setupMode && !joining ? StatusLed::Network::setup : StatusLed::Network::connecting));
+		if (fieldMode)
+			StatusLed::setNetwork(StatusLed::Network::field);
+		else
+			StatusLed::setNetwork(hasIp ? StatusLed::Network::online : (setupMode && !joining ? StatusLed::Network::setup : StatusLed::Network::connecting));
 
 		Message message;
 		if (xQueueReceive(queue, &message, ticksUntilDeadline()) == pdTRUE)
@@ -204,6 +243,11 @@ void Wifi::run()
 			leaveSetup();
 		if (buttonDeadline.due(now))
 			pollButton(now);
+		if (restartDeadline.due(now))
+		{
+			ESP_LOGW(tag, "restarting into field mode");
+			esp_restart();
+		}
 		/* A scan cannot run while the station connects */
 		if (scanPending && (!staBusy || hasIp))
 			scan();
@@ -215,7 +259,9 @@ void Wifi::handle(const Message& message)
 	switch (message.command)
 	{
 		case Command::staStart:
-			if (!setupMode && !staBusy)
+			if (fieldMode)
+				parkRadio();
+			else if (!setupMode && !staBusy)
 				connectSaved();
 			break;
 		case Command::staConnected:
@@ -241,13 +287,16 @@ void Wifi::handle(const Message& message)
 		case Command::radioHold:
 			onRadioHold(static_cast<uint8_t>(message.value));
 			break;
+		case Command::restart:
+			restartDeadline.arm(restartDelayMs);
+			break;
 	}
 }
 
 TickType_t Wifi::ticksUntilDeadline() const
 {
 	int64_t next = INT64_MAX;
-	for (const Deadline* const deadline : {&bootDeadline, &retryDeadline, &joinDeadline, &closeDeadline, &buttonDeadline})
+	for (const Deadline* const deadline : {&bootDeadline, &retryDeadline, &joinDeadline, &closeDeadline, &buttonDeadline, &restartDeadline})
 		if (deadline->at)
 			next = std::min(next, deadline->at);
 	if (next == INT64_MAX)
@@ -259,6 +308,11 @@ TickType_t Wifi::ticksUntilDeadline() const
 
 void Wifi::boot()
 {
+	if (fieldMode)
+	{
+		startField();
+		return;
+	}
 	if (!saved.count)
 	{
 		ESP_LOGI(tag, "no network saved");
@@ -273,6 +327,19 @@ void Wifi::boot()
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	wifiStarted = true;
 	bootDeadline.arm(CONFIG_NETWORK_PROBE_WIFI_STA_TIMEOUT_MS);
+}
+
+void Wifi::startField()
+{
+	/* As out of field mode, but STA_START only parks the radio */
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocol(WIFI_IF_STA, EspNowLink::protocols));
+	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+	wifiStarted = true;
+	parkRadio();
+	ESP_LOGI(tag, "field mode: no network, ESP-NOW alone on channel %u; hold the setup button for %lu s to leave it", fieldChannel, static_cast<unsigned long>(buttonHoldMs / 1000));
+	xEventGroupSetBits(events, readyBit);
 }
 
 void Wifi::enterSetup()
@@ -499,7 +566,11 @@ void Wifi::parkRadio()
 	/* The access point keeps the radio on its own channel */
 	if (setupMode)
 		return;
-	const uint8_t channel = radioHeld ? holdChannel : (homeChannel ? homeChannel : CONFIG_NETWORK_PROBE_AP_CHANNEL);
+	uint8_t channel = homeChannel ? homeChannel : CONFIG_NETWORK_PROBE_AP_CHANNEL;
+	if (fieldMode)
+		channel = fieldChannel;
+	else if (radioHeld)
+		channel = holdChannel;
 	const esp_err_t result = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 	if (result != ESP_OK)
 		ESP_LOGW(tag, "cannot put the radio on channel %u: %s", channel, esp_err_to_name(result));
@@ -706,8 +777,19 @@ void Wifi::pollButton(const int64_t now)
 		buttonPressedAt = now;
 	else if (now - buttonPressedAt >= static_cast<int64_t>(buttonHoldMs) * 1000)
 	{
-		ESP_LOGW(tag, "setup button held: forgetting the saved networks and restarting");
-		SavedNetworks::erase();
+		if (fieldMode)
+		{
+			ESP_LOGW(tag, "setup button held: leaving field mode and restarting; the saved networks stay");
+			RadioSettings settings = getRadio();
+			settings.fieldMode = false;
+			if (!settings.save())
+				ESP_LOGE(tag, "saving the radio settings failed");
+		}
+		else
+		{
+			ESP_LOGW(tag, "setup button held: forgetting the saved networks and restarting");
+			SavedNetworks::erase();
+		}
 		esp_restart();
 	}
 	StatusLed::setButtonHold(buttonPressedAt ? buttonHoldMs - static_cast<uint32_t>((now - buttonPressedAt) / 1000) : 0);

@@ -388,6 +388,13 @@ void NetServer::serviceEspNow()
 		EspNowPort::release(packet);
 	}
 
+	/* Turned off on the setup page */
+	if (client == Client::espnow && !wifi->isEspNowEnabled())
+	{
+		ESP_LOGI(tag, "ESP-NOW was turned off");
+		closeClient();
+	}
+
 	if (client == Client::espnow && esp_timer_get_time() - espnowLastRx > EspNowLink::sessionTimeoutMs * 1000LL)
 	{
 		ESP_LOGW(tag, "nothing from the ESP-NOW client for %" PRIu32 " ms", EspNowLink::sessionTimeoutMs);
@@ -400,6 +407,13 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 	EspNowLink::Header linkHeader;
 	if (!EspNowLink::decodeHeader(packet.data, packet.length, linkHeader))
 		return;
+	/* Off: no answers and no sessions; a dongle that still holds one learns that it ended */
+	if (!wifi->isEspNowEnabled())
+	{
+		if (linkHeader.session != EspNowLink::noSession && linkHeader.kind != EspNowLink::Kind::CLOSE)
+			refuseSession(packet.mac, linkHeader.session);
+		return;
+	}
 	const bool current = client == Client::espnow && linkHeader.session == espnowSession && !memcmp(packet.mac, espnowPeer, sizeof(espnowPeer));
 	if (current)
 	{
