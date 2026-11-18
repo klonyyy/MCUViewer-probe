@@ -267,11 +267,16 @@ void NetServer::closeClient(const bool tellPeer)
 	}
 	else if (client == Client::espnow)
 	{
-		/* Best effort: a dongle that misses it finds out by its next frames going unanswered */
+		/* Once: a dongle that misses it gets a CLOSE for its next packet (refuseSession()) */
+		EspNowPort::abandon();
 		if (tellPeer)
-			EspNowPort::send(espnowPeer, {EspNowLink::Kind::CLOSE, espnowSession, 0, 0}, nullptr, 0);
+			EspNowPort::send(espnowPeer, {EspNowLink::Kind::CLOSE, espnowSession, 0, 0, 0}, nullptr, 0, true);
 		memcpy(endedPeer, espnowPeer, sizeof(endedPeer));
 		endedSession = espnowSession;
+		wifi->holdRadio(0);
+		link->radioRate.store(0, std::memory_order_relaxed);
+		link->radioRssi.store(0, std::memory_order_relaxed);
+		link->radioChannel.store(0, std::memory_order_relaxed);
 		ESP_LOGI(tag, "ESP-NOW session %u ended", espnowSession);
 	}
 	client = Client::none;
@@ -400,6 +405,16 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 	{
 		espnowLastRx = esp_timer_get_time();
 		espnowLimit = linkHeader.limit;
+		/* For GET_STATUS, which may be this very packet */
+		link->radioRssi.store(packet.rssi, std::memory_order_relaxed);
+		link->radioRate.store(EspNowPort::getRate(packet.mac), std::memory_order_relaxed);
+	}
+	else if (linkHeader.session != EspNowLink::noSession && !mayOpenSession(packet, linkHeader))
+	{
+		/* The dongle missed the end of its session, or this probe restarted since: it learns of it now */
+		if (linkHeader.kind != EspNowLink::Kind::CLOSE)
+			refuseSession(packet.mac, linkHeader.session);
+		return;
 	}
 
 	if (linkHeader.kind == EspNowLink::Kind::PING)
@@ -423,10 +438,11 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 	if (linkHeader.session == EspNowLink::noSession)
 	{
 		const size_t length = answerDiscovery(header, payload);
-		if (length)
+		/* Not while the station looks for a network: the dongle would take the channel of the moment for the probe's */
+		if (length && !wifi->isRoaming())
 		{
-			/* With a packet in the air the answer is dropped, and the host asks again */
-			EspNowPort::send(packet.mac, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0}, discoveryFrame.data(), length);
+			/* It goes once, and with a packet in the air not at all: the host asks again */
+			EspNowPort::send(packet.mac, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0}, discoveryFrame.data(), length);
 			if (header.type == NetworkProbe::Type::IDENTIFY)
 				ESP_LOGI(tag, "identifying, as " MACSTR " asked", MAC2STR(packet.mac));
 		}
@@ -440,30 +456,58 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 		espnowRxSeq = linkHeader.seq;
 	}
 	else
-	{
-		if (linkHeader.session == endedSession && !memcmp(packet.mac, endedPeer, sizeof(endedPeer)))
-			return;
-		openEspNowSession(packet.mac, linkHeader);
-	}
+		openEspNowSession(packet, linkHeader);
 	if (!handleFrame(header, payload))
 		closeClient();
 }
 
-void NetServer::openEspNowSession(const uint8_t* const mac, const EspNowLink::Header& linkHeader)
+bool NetServer::mayOpenSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader) const
+{
+	if (linkHeader.session == endedSession && !memcmp(packet.mac, endedPeer, sizeof(endedPeer)))
+		return false;
+	return (linkHeader.kind == EspNowLink::Kind::DATA && linkHeader.seq == 1) || (linkHeader.kind == EspNowLink::Kind::PING && linkHeader.seq == 0);
+}
+
+void NetServer::refuseSession(const uint8_t* const mac, const uint16_t session)
+{
+	if (session != refusedSession || memcmp(mac, refusedPeer, sizeof(refusedPeer)))
+	{
+		ESP_LOGW(tag, "ESP-NOW session %u of " MACSTR " is not served here (ended, or before a restart): telling it to close", session, MAC2STR(mac));
+		refusedSession = session;
+		memcpy(refusedPeer, mac, sizeof(refusedPeer));
+	}
+	/* With a packet in the air it is not sent: the dongle's next packet asks again */
+	EspNowPort::send(mac, {EspNowLink::Kind::CLOSE, session, 0, 0, 0}, nullptr, 0, true);
+}
+
+void NetServer::openEspNowSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader)
 {
 	if (hasClient())
 	{
 		ESP_LOGI(tag, "an ESP-NOW client takes over the session");
 		closeClient();
 	}
-	memcpy(espnowPeer, mac, sizeof(espnowPeer));
+	memcpy(espnowPeer, packet.mac, sizeof(espnowPeer));
 	const uint16_t session = linkHeader.session;
 	espnowSession = session;
 	espnowRxSeq = linkHeader.seq;
 	espnowTxSeq = 1;
 	espnowLimit = linkHeader.limit;
 	espnowLastRx = esp_timer_get_time();
-	ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected, session %u", MAC2STR(mac), session);
+	/*
+	 * The dongle stays on the channel it says, where it found the probe: the station must not take the radio off it.
+	 * The packet may have come in elsewhere, through a channel next to it or in a scan.
+	 */
+	const uint8_t channel = linkHeader.channel ? linkHeader.channel : packet.channel;
+	wifi->holdRadio(channel);
+	EspNowPort::resetRate(packet.mac);
+	link->radioChannel.store(channel, std::memory_order_relaxed);
+	link->radioRssi.store(packet.rssi, std::memory_order_relaxed);
+	link->radioRate.store(EspNowPort::getRate(packet.mac), std::memory_order_relaxed);
+	if (channel == packet.channel)
+		ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected on channel %u, session %u", MAC2STR(packet.mac), channel, session);
+	else
+		ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected on channel %u (heard on %u), session %u", MAC2STR(packet.mac), channel, packet.channel, session);
 	startSession(Client::espnow, EspNowLink::maxPayload);
 }
 
@@ -685,7 +729,7 @@ bool NetServer::pumpTx()
 		if (client == Client::espnow)
 		{
 			/* Busy keeps the frame for when a send callback, or the next select() timeout, wakes the task */
-			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, {EspNowLink::Kind::DATA, espnowSession, espnowTxSeq, 0}, txFrame.data(), txLength);
+			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, {EspNowLink::Kind::DATA, espnowSession, espnowTxSeq, 0, 0}, txFrame.data(), txLength);
 			if (result == EspNowPort::SendResult::busy)
 				return true;
 			if (result == EspNowPort::SendResult::failed)

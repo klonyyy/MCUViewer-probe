@@ -31,6 +31,8 @@ class Wifi;
  * ESP-NOW: each packet carries one frame, so an ESP-NOW session announces a smaller max_payload and max_read in HELLO,
  * and READ_BULK chunks shrink to match. Sessions follow EspNowLink: they end with CLOSE or after a silence, resends are
  * dropped by their seq, and a frame goes only while the dongle's limit allows it, as over TCP while the window does.
+ * Packets of a session the probe does not serve get CLOSE back. While a session lasts, it holds the radio on its
+ * channel (Wifi::holdRadio()).
  *
  * SWO needs no SWD, so the net task owns the SWO capture: it answers SWO_START and SWO_STOP itself, and sends the
  * captured bytes in SWO_DATA frames, taking turns with DATA.
@@ -98,7 +100,18 @@ class NetServer
 	 */
 	void serviceEspNow();
 	void handlePacket(const EspNowPort::Packet& packet);
-	void openEspNowSession(const uint8_t* mac, const EspNowLink::Header& linkHeader);
+	void openEspNowSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader);
+
+	/**
+	 * @return Whether a packet of a session the probe does not serve may start one: the first DATA, or a PING before
+	 * it, of a session that did not end here.
+	 */
+	bool mayOpenSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader) const;
+
+	/**
+	 * @brief Answers a packet of a session the probe does not serve with CLOSE, so its dongle ends it.
+	 */
+	void refuseSession(const uint8_t* mac, uint16_t session);
 
 	/**
 	 * @brief Checks that data holds exactly one frame, with a valid CRC.
@@ -222,6 +235,8 @@ class NetServer
 	int64_t espnowLastRx = 0;
 	uint8_t endedPeer[6] = {};
 	uint16_t endedSession = EspNowLink::noSession;
+	uint8_t refusedPeer[6] = {}; /**< The last session refused, so it is logged once. */
+	uint16_t refusedSession = EspNowLink::noSession;
 
 	bool requestOutstanding = false; /**< A request was handed over and its answer is not sent yet. */
 	bool dropResponse = false;		 /**< The client of the outstanding request is gone. */

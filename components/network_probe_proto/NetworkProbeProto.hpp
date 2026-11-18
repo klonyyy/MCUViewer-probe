@@ -46,6 +46,7 @@ enum class Type : uint8_t
 	SWO_STOP = 0x14,
 	READ_BULK = 0x15, /* answered with READ_DATA frames, then the RESP */
 	DONGLE_SELECT = 0x40, /* answered by an ESP-NOW dongle itself: the probe to talk to */
+	DONGLE_STATUS = 0x41, /* answered by an ESP-NOW dongle itself: its side of the link to the selected probe */
 	RESP = 0x80,
 	DATA = 0x81,
 	EVENT = 0x82,
@@ -126,7 +127,8 @@ constexpr size_t connectResponseSize = 16;      /* u32 dpidr, u32 targetid, u32 
 constexpr size_t readRequestSize = 6;           /* u32 address, u16 length */
 constexpr size_t writeRequestHeaderSize = 6;    /* u32 address, u16 length, then the data */
 constexpr size_t readListEntrySize = 5;         /* u32 address, u8 size; the request starts with u8 count */
-constexpr size_t statusResponseSize = 16;       /* u8 link, u8 reserved[3], u32 clock, u32 target_errors, u32 uptime_ms */
+constexpr size_t statusResponseSize = 16;       /* u8 link, u8 radio_rate, i8 radio_rssi, u8 radio_channel, u32 clock, u32 target_errors, u32 uptime_ms */
+constexpr size_t dongleStatusResponseSize = 3;  /* u8 radio_rate, i8 radio_rssi, u8 radio_channel */
 constexpr size_t discoverRequestSize = 2;       /* u16 protocol */
 constexpr size_t discoverResponseFixedSize = 6; /* u16 protocol, u16 tcp_port, u8 session, u8 reserved; name, firmware, id and hostname follow */
 constexpr size_t planHeaderSize = 7;            /* u16 plan_id, u32 period_us, u8 nblocks */
@@ -160,6 +162,12 @@ constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a
  * it go to that probe, until the port closes or another DONGLE_SELECT; without a probe selected, the dongle answers
  * requests NO_PROBE. Max_payload is smaller than over TCP, as one frame travels in one ESP-NOW packet. Right after
  * opening the port, a host may get the tail of a frame sent before; it skips bytes until a frame checks out.
+ *
+ * Radio fields: each side of an ESP-NOW link tells its view of it. The radio fields of GET_STATUS are the probe's, all
+ * 0 for a client over TCP; DONGLE_STATUS, without payload, answers the dongle's, or NO_PROBE without a probe selected.
+ * radio_rate is the rate the side sends its packets at, in 0.5 Mb/s (22 is 11 Mb/s): each side picks its own and moves
+ * it with the signal. radio_rssi is the signal of the last packet from the other side, in dBm, 0 before the first.
+ * radio_channel is the Wi-Fi channel of the link.
  */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */

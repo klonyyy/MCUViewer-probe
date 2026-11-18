@@ -1,12 +1,14 @@
 menu "NETWORK PROBE dongle"
 
-    config DONGLE_CHANNEL
-        int "Wi-Fi channel"
-        range 1 13
-        default 6
+    config DONGLE_COUNTRY
+        string "Wi-Fi country code"
+        default "01"
         help
-            ESP-NOW channel. A probe talks on the channel its radio is on: the channel of the network it
-            joined, or in setup mode the channel of its access point, 6 by default.
+            Sets the channels the dongle looks for probes on. A probe talks on the channel its radio is
+            on: the channel of the network it joined, or in setup mode the channel of its access point.
+            "01", the world-safe default, allows channels 1 to 11. To reach probes on networks on
+            channels 12 and 13, set the country you are in, where it allows them, for example "PL" or
+            "DE"; see esp_wifi_set_country_code() for the codes ESP-IDF knows.
 
     config DONGLE_LED_GPIO
         int "Status LED GPIO (-1 = none)"

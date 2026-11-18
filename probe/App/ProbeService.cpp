@@ -286,6 +286,9 @@ NetworkProbe::Status ProbeService::handleGetStatus(const uint16_t length, uint16
 	uint8_t* const data = link->responseData;
 	memset(data, 0, NetworkProbe::statusResponseSize);
 	data[0] = NetworkProbe::toByte(streaming ? NetworkProbe::Link::STREAMING : (TargetLink::isConnected() ? NetworkProbe::Link::CONNECTED : NetworkProbe::Link::DISCONNECTED));
+	data[1] = link->radioRate.load(std::memory_order_relaxed);
+	data[2] = static_cast<uint8_t>(link->radioRssi.load(std::memory_order_relaxed));
+	data[3] = link->radioChannel.load(std::memory_order_relaxed);
 	NetworkProbe::putU32(data + 4, platform_max_frequency_get());
 	NetworkProbe::putU32(data + 8, TargetLink::getErrorCount());
 	NetworkProbe::putU32(data + 12, static_cast<uint32_t>(esp_timer_get_time() / 1000));

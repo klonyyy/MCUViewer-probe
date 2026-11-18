@@ -99,9 +99,11 @@ The probe joins one of the networks saved on it, up to five. Out of the box no n
 
 At every boot the probe scans and joins the strongest saved network in range; if that fails,
 it tries the others by signal strength. When the link drops, it starts over the same way, so
-moving the probe between, say, home and the lab needs no setup. If none gives an IP address
-within 15 s, setup mode starts again, and the probe keeps trying the saved networks every 30 s,
-so after a router outage it comes back by itself. Hidden networks do not show in a scan: they
+moving the probe between, say, home and the lab needs no setup; while none answers, it waits
+between the rounds, 2 s at first and up to 30 s. If none gives an IP address
+within 15 s of booting, setup mode starts again, and the probe keeps trying the saved networks every 30 s,
+so after a router outage it comes back by itself. While an ESP-NOW dongle holds a session, the
+probe does not look for networks at all, see [the dongle](dongle/README.md#channels). Hidden networks do not show in a scan: they
 are tried in the order of saving when no saved network is in sight. While the access point is up, MCUViewer and GDB also work
 over it, at 192.168.4.1.
 

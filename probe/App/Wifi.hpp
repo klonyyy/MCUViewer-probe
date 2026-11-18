@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <mutex>
 
 #include "NetworkSettings.hpp"
@@ -28,7 +29,13 @@
  * an access point named after the device id serves the setup page (SetupPortal), and the station keeps trying the
  * saved networks in the background. A network chosen on the setup page is tried while the access point stays up, added
  * to the saved ones once it gives an IP address, and the access point closes a minute later. On its network the probe
- * reconnects whenever the link drops.
+ * reconnects whenever the link drops; when no saved network answers, it rests before the next round, roundPauseMinMs
+ * at first and twice as long each time up to roundPauseMaxMs, with the radio on the channel of the network joined
+ * last, so that a dongle finds the probe on one channel most of the time.
+ *
+ * An ESP-NOW session holds the radio (holdRadio()): while it lasts, the station neither scans nor connects by itself,
+ * as either takes the radio off the session's channel, and an attempt under way stops. What was due waits until
+ * releaseDelayMs after the session. Joins and scans from the setup page still go ahead: someone asked for them.
  *
  * The Wi-Fi task owns all of it: the Wi-Fi events and the setup page only queue commands for it, the setup button and
  * the timeouts are polled by it.
@@ -97,6 +104,19 @@ class Wifi
 	 */
 	size_t getNetworks(Network* networks, size_t maxCount, bool& scanning);
 
+	/**
+	 * @brief The net task: an ESP-NOW session starts on channel, the dongle's, or ends, with channel 0. A scan of the
+	 * station's own stops at once, so the hold does not wait for it.
+	 */
+	void holdRadio(uint8_t channel);
+
+	/**
+	 * @brief Whether the station has the radio off the channel it rests on: it scans, or connects on its own. Callable
+	 * from any task. The net task does not answer ESP-NOW discovery then: the answer would show the dongle a channel the
+	 * probe does not stay on.
+	 */
+	bool isRoaming() const { return roaming.load(std::memory_order_relaxed); }
+
 	const char* getDeviceId() const { return deviceId; }
 
 	/**
@@ -115,7 +135,10 @@ class Wifi
 	static constexpr size_t queueLength = 16;
 	static constexpr uint32_t postTimeoutMs = 100;
 	static constexpr uint32_t reconnectDelayMs = 1000; /**< After esp_wifi_connect() itself failed. */
-	static constexpr uint32_t setupRetryMs = 30000;	   /**< How often setup mode tries the saved network. */
+	static constexpr uint32_t roundPauseMinMs = 2000;  /**< Between rounds over the saved networks, while none answers. */
+	static constexpr uint32_t roundPauseMaxMs = 30000;
+	static constexpr uint32_t releaseDelayMs = 5000; /**< After an ESP-NOW session: a host that comes back finds the probe where it was. */
+	static constexpr uint32_t setupRetryMs = 30000;	 /**< How often setup mode tries the saved network. */
 	static constexpr uint32_t setupCloseMs = 60000;	   /**< The access point stays this long after the station got an address. */
 	static constexpr uint32_t joinTimeoutMs = 45000;
 	static constexpr uint8_t maxJoinAttempts = 3; /**< A wrong password ends the join at the first one. */
@@ -126,12 +149,13 @@ class Wifi
 	enum class Command : uint8_t
 	{
 		staStart,
-		staConnected,
+		staConnected,	 /**< value: the channel. */
 		staDisconnected, /**< value: the reason. */
 		gotIp,			 /**< value: the address. */
 		apStart,
 		join, /**< The settings are in requested. */
 		scan,
+		radioHold, /**< value: the channel of the ESP-NOW session, 0 when it ended. */
 	};
 
 	struct Message
@@ -184,6 +208,18 @@ class Wifi
 	 * @return False if every saved network of the current round was tried.
 	 */
 	bool connectNextSaved();
+
+	/**
+	 * @brief Starts a round over the saved networks, or while an ESP-NOW session holds the radio, once it lets go.
+	 */
+	void retrySaved();
+	void deferToRelease();
+
+	/**
+	 * @brief Puts the idle station's radio on the channel a dongle finds it on: the session's, else the last network's.
+	 */
+	void parkRadio();
+	void onRadioHold(uint8_t channel);
 	void applyHostname(const char* hostname);
 	void onDisconnected(uint32_t reason);
 	void onGotIp(uint32_t address);
@@ -222,6 +258,13 @@ class Wifi
 	bool joinAfterDisconnect = false; /**< The join waits for the station to let go of the previous connection. */
 	uint8_t joinAttempts = 0;
 	bool scanPending = false;
+	uint32_t roundPauseMs = roundPauseMinMs;
+	uint8_t homeChannel = 0; /**< Of the network joined last, 0 before the first. */
+	bool radioHeld = false;
+	uint8_t holdChannel = 0;
+	bool retryOnRelease = false;
+	std::atomic<bool> roaming{false};
+	std::atomic<bool> ownScan{false}; /**< A scan for connectSaved(), which a hold stops. */
 	int64_t buttonPressedAt = 0;
 	Deadline bootDeadline;
 	Deadline retryDeadline;

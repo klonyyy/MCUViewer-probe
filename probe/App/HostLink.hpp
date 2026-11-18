@@ -73,6 +73,10 @@ struct HostLink
 	/* Net task */
 	std::atomic<uint32_t> sessionGeneration{0}; /**< +1 when a client session ends. */
 	std::atomic<bool> gdbRequested{false};		/**< A GDB client waits; set by the net task, cleared by the SWD owner task after the GDB session. */
+	/* The ESP-NOW link of the client, for GET_STATUS: all 0 without an ESP-NOW client */
+	std::atomic<uint8_t> radioRate{0}; /**< The probe sends to the dongle at it, in 0.5 Mb/s. */
+	std::atomic<int8_t> radioRssi{0};  /**< Of the last packet from the dongle, in dBm. */
+	std::atomic<uint8_t> radioChannel{0};
 
 	/* SWD owner task */
 	std::atomic<bool> gdbActive{false};		   /**< A GDB session runs; the net task answers BUSY. */

@@ -14,6 +14,7 @@
 #include <new>
 
 #include "EspNowPort.hpp"
+#include "EspNowRate.hpp"
 #include "StatusLed.hpp"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -127,6 +128,14 @@ void Wifi::requestScan(const bool force)
 	post(Command::scan);
 }
 
+void Wifi::holdRadio(const uint8_t channel)
+{
+	/* The Wi-Fi task waits in it, and would see the hold only after it */
+	if (channel && ownScan)
+		esp_wifi_scan_stop();
+	post(Command::radioHold, channel);
+}
+
 size_t Wifi::getNetworks(Network* const out, const size_t maxCount, bool& scanning)
 {
 	std::lock_guard<std::mutex> lock(statusLock);
@@ -146,7 +155,7 @@ void Wifi::handleEvent(esp_event_base_t base, int32_t id, void* data)
 	if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
 		post(Command::staStart);
 	else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED)
-		post(Command::staConnected);
+		post(Command::staConnected, static_cast<const wifi_event_sta_connected_t*>(data)->channel);
 	else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
 		post(Command::staDisconnected, static_cast<const wifi_event_sta_disconnected_t*>(data)->reason);
 	else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
@@ -188,7 +197,7 @@ void Wifi::run()
 			enterSetup();
 		}
 		if (retryDeadline.due(now) && !staBusy && !joining)
-			connectSaved();
+			retrySaved();
 		if (joinDeadline.due(now) && joining)
 			onJoinTimeout();
 		if (closeDeadline.due(now) && hasIp)
@@ -211,6 +220,8 @@ void Wifi::handle(const Message& message)
 			break;
 		case Command::staConnected:
 			staLinked = true;
+			homeChannel = static_cast<uint8_t>(message.value);
+			roaming = false;
 			break;
 		case Command::staDisconnected:
 			onDisconnected(message.value);
@@ -226,6 +237,9 @@ void Wifi::handle(const Message& message)
 			break;
 		case Command::scan:
 			scanPending = true;
+			break;
+		case Command::radioHold:
+			onRadioHold(static_cast<uint8_t>(message.value));
 			break;
 	}
 }
@@ -252,9 +266,10 @@ void Wifi::boot()
 		return;
 	}
 
-	/* STA_START connects */
+	/* STA_START connects; ESP-NOW's long range rate needs LR next to b/g/n, which joins ordinary networks still */
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 	ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocol(WIFI_IF_STA, EspNowLink::protocols));
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	wifiStarted = true;
 	bootDeadline.arm(CONFIG_NETWORK_PROBE_WIFI_STA_TIMEOUT_MS);
@@ -295,6 +310,7 @@ void Wifi::enterSetup()
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &config));
 	ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocol(WIFI_IF_STA, EspNowLink::protocols));
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	wifiStarted = true;
 	EspNowPort::resume();
@@ -327,12 +343,15 @@ void Wifi::connectStation(const NetworkSettings& settings)
 	ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &config));
 
 	ESP_LOGI(tag, "connecting to \"%s\"", settings.ssid);
+	/* The connection looks for the network on every channel */
+	roaming = true;
 	const esp_err_t result = esp_wifi_connect();
 	if (result == ESP_OK)
 	{
 		staBusy = true;
 		return;
 	}
+	roaming = false;
 
 	ESP_LOGE(tag, "esp_wifi_connect() failed: %s", esp_err_to_name(result));
 	if (joining)
@@ -347,7 +366,9 @@ void Wifi::connectSaved()
 	orderNext = 0;
 	if (saved.count > 1)
 	{
+		ownScan = true;
 		scan();
+		ownScan = false;
 		/* The scan lists the networks strongest first, and so does the order */
 		std::lock_guard<std::mutex> lock(statusLock);
 		for (size_t n = 0; n < networkCount; ++n)
@@ -421,10 +442,22 @@ void Wifi::onDisconnected(const uint32_t reason)
 
 	if (!setupMode)
 	{
-		ESP_LOGW(tag, "disconnected (reason %lu), reconnecting", static_cast<unsigned long>(reason));
-		/* A lost link starts over with the strongest network; a failed attempt goes on with the next one */
-		if (wasLinked || !connectNextSaved())
-			connectSaved();
+		ESP_LOGW(tag, "disconnected (reason %lu)", static_cast<unsigned long>(reason));
+		/* A lost link starts over with the strongest network at once, a failed attempt goes on with the next one */
+		if (wasLinked)
+		{
+			roundPauseMs = roundPauseMinMs;
+			retrySaved();
+		}
+		else if (radioHeld)
+			deferToRelease();
+		else if (!connectNextSaved())
+		{
+			ESP_LOGI(tag, "no saved network reachable, trying again in %lu s", static_cast<unsigned long>(roundPauseMs / 1000));
+			parkRadio();
+			retryDeadline.arm(roundPauseMs);
+			roundPauseMs = std::min(roundPauseMs * 2, roundPauseMaxMs);
+		}
 		return;
 	}
 
@@ -432,10 +465,66 @@ void Wifi::onDisconnected(const uint32_t reason)
 	{
 		if (wasLinked)
 			orderNext = orderCount;
+		if (radioHeld)
+		{
+			deferToRelease();
+			return;
+		}
 		if (connectNextSaved())
 			return;
 		ESP_LOGI(tag, "no saved network reachable (reason %lu), trying again in %lu s", static_cast<unsigned long>(reason), static_cast<unsigned long>(setupRetryMs / 1000));
+		parkRadio();
 		retryDeadline.arm(setupRetryMs);
+	}
+}
+
+void Wifi::retrySaved()
+{
+	if (radioHeld)
+		deferToRelease();
+	else
+		connectSaved();
+}
+
+void Wifi::deferToRelease()
+{
+	ESP_LOGI(tag, "an ESP-NOW session holds the radio: the saved networks wait until it ends");
+	retryOnRelease = true;
+	parkRadio();
+}
+
+void Wifi::parkRadio()
+{
+	roaming = false;
+	/* The access point keeps the radio on its own channel */
+	if (setupMode)
+		return;
+	const uint8_t channel = radioHeld ? holdChannel : (homeChannel ? homeChannel : CONFIG_NETWORK_PROBE_AP_CHANNEL);
+	const esp_err_t result = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+	if (result != ESP_OK)
+		ESP_LOGW(tag, "cannot put the radio on channel %u: %s", channel, esp_err_to_name(result));
+}
+
+void Wifi::onRadioHold(const uint8_t channel)
+{
+	if (channel)
+	{
+		radioHeld = true;
+		holdChannel = channel;
+		/* An attempt of the station's own takes the radio off the channel: it stops, and its round waits */
+		if (staBusy && !staLinked && !joining)
+			ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+		/* Idle between rounds: on to the session's channel, should the dongle have found the probe elsewhere */
+		else if (!staBusy)
+			parkRadio();
+		return;
+	}
+
+	radioHeld = false;
+	if (retryOnRelease)
+	{
+		retryOnRelease = false;
+		retryDeadline.arm(releaseDelayMs);
 	}
 }
 
@@ -447,6 +536,7 @@ void Wifi::onGotIp(const uint32_t address)
 		return;
 
 	bootDeadline.disarm();
+	roundPauseMs = roundPauseMinMs;
 	if (joining)
 	{
 		joining = false;
@@ -536,6 +626,7 @@ void Wifi::finishJoin(const char* const error)
 	}
 
 	applyHostname(saved.hostname);
+	parkRadio();
 	/* Once the station is free, setup mode tries the saved networks again */
 	if (staBusy)
 		esp_wifi_disconnect();
@@ -546,6 +637,7 @@ void Wifi::finishJoin(const char* const error)
 void Wifi::scan()
 {
 	scanPending = false;
+	roaming = true;
 
 	std::unique_ptr<wifi_ap_record_t[]> records(new (std::nothrow) wifi_ap_record_t[maxScanRecords]);
 	uint16_t count = maxScanRecords;
@@ -558,6 +650,9 @@ void Wifi::scan()
 		esp_wifi_clear_ap_list();
 		count = 0;
 	}
+	/* Back on the channel of the network, or of the access point; else a connection or parkRadio() follows */
+	if (staLinked || setupMode)
+		roaming = false;
 
 	std::lock_guard<std::mutex> lock(statusLock);
 	networkCount = 0;

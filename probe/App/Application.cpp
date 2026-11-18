@@ -7,6 +7,7 @@
 
 #include "StatusLed.hpp"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -22,12 +23,49 @@ App app;
 namespace
 {
 constexpr const char* tag = "network_probe";
+
+const char* resetReasonName(const esp_reset_reason_t reason)
+{
+	switch (reason)
+	{
+		case ESP_RST_POWERON:
+			return "power-on";
+		case ESP_RST_EXT:
+			return "the reset pin";
+		case ESP_RST_SW:
+			return "a software restart";
+		case ESP_RST_PANIC:
+			return "a panic";
+		case ESP_RST_INT_WDT:
+			return "the interrupt watchdog";
+		case ESP_RST_TASK_WDT:
+			return "the task watchdog";
+		case ESP_RST_WDT:
+			return "a watchdog";
+		case ESP_RST_BROWNOUT:
+			return "a brownout: the supply voltage dropped";
+		case ESP_RST_USB:
+			return "a USB reset";
+		case ESP_RST_JTAG:
+			return "JTAG";
+		case ESP_RST_PWR_GLITCH:
+			return "a power glitch";
+		case ESP_RST_CPU_LOCKUP:
+			return "a CPU lockup";
+		default:
+			return "an unknown reason";
+	}
+}
 }  // namespace
 
 void App::init()
 {
 	/* First, so the LED shows the network coming up */
 	StatusLed::start();
+
+	/* A probe powered by its target restarts with it, or browns out when the radio draws more than the supply gives */
+	const esp_reset_reason_t reason = esp_reset_reason();
+	ESP_LOGI(tag, "started after %s (reset reason %d)", resetReasonName(reason), static_cast<int>(reason));
 
 	esp_err_t result = nvs_flash_init();
 	if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND)

@@ -27,9 +27,6 @@ namespace
 {
 constexpr const char* tag = "dongle";
 constexpr uint8_t broadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-/* As on the probe: 16-QAM, about 2 MB/s with a margin (Tools/espnow_bench/RESULTS.md); broadcasts keep 1 Mb/s, for range */
-constexpr wifi_phy_mode_t linkMode = WIFI_PHY_MODE_HT20;
-constexpr wifi_phy_rate_t linkRate = WIFI_PHY_RATE_MCS3_LGI;
 constexpr uint32_t ledTaskStackSize = 3072;
 constexpr uint32_t ledTaskPriority = 2;
 constexpr uint32_t ledPeriodMs = 50;
@@ -87,6 +84,8 @@ void Dongle::onReceive(const esp_now_recv_info_t* const info, const uint8_t* con
 		return;
 	}
 	memcpy(packet->mac, info->src_addr, sizeof(packet->mac));
+	packet->rssi = static_cast<int8_t>(info->rx_ctrl->rssi);
+	packet->channel = static_cast<uint8_t>(info->rx_ctrl->channel);
 	packet->length = static_cast<uint16_t>(length);
 	memcpy(packet->data, data, length);
 	xQueueSend(self.rxQueue, &packet, 0);
@@ -96,6 +95,7 @@ void Dongle::onReceive(const esp_now_recv_info_t* const info, const uint8_t* con
 void Dongle::onSent(const esp_now_send_info_t* const info, const esp_now_send_status_t status)
 {
 	Dongle& self = *instance;
+	self.txEndUs = esp_timer_get_time();
 	if (status == ESP_NOW_SEND_SUCCESS)
 	{
 		if (info && info->des_addr && !memcmp(info->des_addr, self.probeMac, sizeof(self.probeMac)))
@@ -129,7 +129,7 @@ void Dongle::run()
 	uint32_t reportedLost = 0;
 	while (true)
 	{
-		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(hostQueueCount ? hostPollMs : pollMs));
+		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(hostQueueCount || sweepChannel ? busyPollMs : pollMs));
 		serviceLine();
 		readHost();
 
@@ -138,6 +138,7 @@ void Dongle::run()
 			handlePacket(packet);
 		flushHost();
 		serviceSession();
+		serviceSweep();
 		serviceTx();
 		tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
 
@@ -190,15 +191,22 @@ void Dongle::startWifi()
 	}
 	ESP_ERROR_CHECK(result);
 
-	/* A station that joins nothing: ESP-NOW only */
+	/* A station that joins nothing: ESP-NOW only, on the channels the country allows, at every rung of the ladder */
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 	const wifi_init_config_t initConfig = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&initConfig));
 	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+	ESP_ERROR_CHECK(esp_wifi_set_country_code(CONFIG_DONGLE_COUNTRY, true));
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 	ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, EspNowLink::protocols));
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-	ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_DONGLE_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+	wifi_country_t country = {};
+	ESP_ERROR_CHECK(esp_wifi_get_country(&country));
+	firstChannel = country.schan;
+	lastChannel = static_cast<uint8_t>(country.schan + country.nchan - 1);
+	setChannel(firstChannel);
 
 	ESP_ERROR_CHECK(esp_now_init());
 	ESP_ERROR_CHECK(esp_now_register_recv_cb(onReceive));
@@ -210,7 +218,7 @@ void Dongle::startWifi()
 
 	uint8_t mac[6];
 	esp_read_mac(mac, ESP_MAC_WIFI_STA);
-	ESP_LOGI(tag, "ESP-NOW on channel %d as " MACSTR, CONFIG_DONGLE_CHANNEL, MAC2STR(mac));
+	ESP_LOGI(tag, "ESP-NOW on channels %u to %u (country %s) as " MACSTR, firstChannel, lastChannel, CONFIG_DONGLE_COUNTRY, MAC2STR(mac));
 }
 
 void Dongle::startUsb()
@@ -350,11 +358,18 @@ void Dongle::handleHostFrame(const NetworkProbe::FrameHeader& header, const uint
 	{
 		case NetworkProbe::Type::DISCOVER:
 		case NetworkProbe::Type::IDENTIFY:
-			/* Every probe in range hears it; the answers come back as packets */
-			queuePacket(broadcastMac, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0}, frame, length);
+			/* Every probe in range hears it; the answers come back as packets. The session owns the radio */
+			answeredCount = 0;
+			if (selected)
+				queuePacket(broadcastMac, probeChannel, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0}, frame, length);
+			else
+				startSweep(frame, length);
 			return;
 		case NetworkProbe::Type::DONGLE_SELECT:
 			handleSelect(header, frame + NetworkProbe::headerSize);
+			return;
+		case NetworkProbe::Type::DONGLE_STATUS:
+			handleStatus(header);
 			return;
 		default:
 			break;
@@ -386,13 +401,32 @@ void Dongle::handleSelect(const NetworkProbe::FrameHeader& header, const uint8_t
 	answerHost(header.seq, header.type, NetworkProbe::Status::NO_PROBE);
 }
 
-void Dongle::answerHost(const uint16_t seq, const NetworkProbe::Type request, const NetworkProbe::Status status)
+void Dongle::handleStatus(const NetworkProbe::FrameHeader& header)
 {
-	uint8_t frame[NetworkProbe::frameOverhead + NetworkProbe::respHeaderSize];
-	NetworkProbe::encodeHeader(frame, NetworkProbe::Type::RESP, NetworkProbe::respHeaderSize, seq);
+	if (header.length != 0)
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::MALFORMED);
+		return;
+	}
+	if (!selected)
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::NO_PROBE);
+		return;
+	}
+	const uint8_t data[NetworkProbe::dongleStatusResponseSize] = {EspNowLink::rates[ladder.getRung()].halfMbps, static_cast<uint8_t>(probeRssi), probeChannel};
+	answerHost(header.seq, header.type, NetworkProbe::Status::OK, data, sizeof(data));
+}
+
+void Dongle::answerHost(const uint16_t seq, const NetworkProbe::Type request, const NetworkProbe::Status status, const uint8_t* const data, const size_t dataLength)
+{
+	uint8_t frame[NetworkProbe::frameOverhead + NetworkProbe::respHeaderSize + NetworkProbe::dongleStatusResponseSize];
+	const uint16_t payloadLength = static_cast<uint16_t>(NetworkProbe::respHeaderSize + dataLength);
+	NetworkProbe::encodeHeader(frame, NetworkProbe::Type::RESP, payloadLength, seq);
 	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(request);
 	frame[NetworkProbe::headerSize + 1] = NetworkProbe::toByte(status);
-	const size_t length = NetworkProbe::sealFrame(frame, NetworkProbe::respHeaderSize);
+	if (dataLength)
+		memcpy(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize, data, dataLength);
+	const size_t length = NetworkProbe::sealFrame(frame, payloadLength);
 	if (!writeHost(frame, length) && hostOpen)
 	{
 		/* Small and rare: worth a short wait for room */
@@ -437,7 +471,15 @@ void Dongle::handlePacket(Packet* const packet)
 		releasePacket(packet);
 		return;
 	}
-	const bool fromSession = selected && linkHeader.session == session && !memcmp(packet->mac, probeMac, sizeof(probeMac));
+	const bool fromProbe = selected && !memcmp(packet->mac, probeMac, sizeof(probeMac));
+	const bool fromSession = fromProbe && linkHeader.session == session;
+	if (fromProbe)
+	{
+		probeRssi = packet->rssi;
+		/* The probe is there: the packet waiting for it goes now */
+		if (txState == TxState::quiet)
+			quietUntilUs = 0;
+	}
 
 	if (linkHeader.kind == EspNowLink::Kind::CLOSE && fromSession)
 	{
@@ -456,8 +498,9 @@ void Dongle::handlePacket(Packet* const packet)
 	const size_t length = packet->length - EspNowLink::headerSize;
 	if (linkHeader.session == EspNowLink::noSession)
 	{
-		rememberProbe(packet->mac, frame, length);
-		if (!writeHost(frame, length))
+		/* A probe close by also answers the broadcasts on the channels next to its own: it says where it is */
+		rememberProbe(packet->mac, linkHeader.channel ? linkHeader.channel : packet->channel, frame, length);
+		if (firstAnswer(packet->mac) && !writeHost(frame, length))
 			hostDrops++;
 		releasePacket(packet);
 		return;
@@ -481,7 +524,17 @@ void Dongle::releasePacket(Packet* const packet)
 	xQueueSend(freeQueue, &packet, 0);
 }
 
-void Dongle::rememberProbe(const uint8_t* const mac, const uint8_t* const frame, const size_t length)
+bool Dongle::firstAnswer(const uint8_t* const mac)
+{
+	for (size_t i = 0; i < answeredCount; ++i)
+		if (!memcmp(answered[i], mac, sizeof(answered[i])))
+			return false;
+	if (answeredCount < maxProbes)
+		memcpy(answered[answeredCount++], mac, sizeof(answered[0]));
+	return true;
+}
+
+void Dongle::rememberProbe(const uint8_t* const mac, const uint8_t channel, const uint8_t* const frame, const size_t length)
 {
 	NetworkProbe::FrameHeader header;
 	if (length < NetworkProbe::frameOverhead || !NetworkProbe::decodeHeader(frame, header) || length != NetworkProbe::frameOverhead + header.length || !frameCrcMatches(frame, header.length))
@@ -517,13 +570,18 @@ void Dongle::rememberProbe(const uint8_t* const mac, const uint8_t* const frame,
 	}
 	strlcpy(slot->id, id, sizeof(slot->id));
 	memcpy(slot->mac, mac, sizeof(slot->mac));
+	slot->channel = channel;
 	slot->used = true;
 }
 
 void Dongle::select(const Probe& probe)
 {
+	/* The CLOSE to the probe before goes on its channel, the sweep's broadcasts queued already on theirs */
 	deselect(true);
+	sweepChannel = 0;
 	memcpy(probeMac, probe.mac, sizeof(probeMac));
+	probeChannel = probe.channel;
+	probeRssi = 0;
 
 	esp_now_peer_info_t peer = {};
 	memcpy(peer.peer_addr, probeMac, sizeof(peer.peer_addr));
@@ -537,14 +595,10 @@ void Dongle::select(const Probe& probe)
 			esp_now_del_peer(old.peer_addr);
 		result = esp_now_add_peer(&peer);
 	}
+	/* Without it ESP-NOW sends at 1 Mb/s */
+	ladder.reset();
 	if (result == ESP_OK)
-	{
-		/* Without it ESP-NOW sends at 1 Mb/s */
-		esp_now_rate_config_t rate = {};
-		rate.phymode = linkMode;
-		rate.rate = linkRate;
-		result = esp_now_set_peer_rate_config(probeMac, &rate);
-	}
+		result = EspNowLink::setPeerRate(probeMac, ladder.getRung());
 	if (result != ESP_OK)
 		ESP_LOGW(tag, "peer " MACSTR ": %s", MAC2STR(probeMac), esp_err_to_name(result));
 
@@ -552,18 +606,22 @@ void Dongle::select(const Probe& probe)
 		session = static_cast<uint16_t>(esp_random());
 	while (session == EspNowLink::noSession);
 	txSeq = 1;
+	lastDataSeq = 0;
 	rxSeq = 0;
 	advertisedLimit = 0;
+	quietReported = false;
 	lastSendUs = esp_timer_get_time();
 	lastAckUs = lastSendUs;
 	selected = true;
-	ESP_LOGI(tag, "session %u with %s, " MACSTR, session, probe.id, MAC2STR(probeMac));
+	ESP_LOGI(tag, "session %u with %s, " MACSTR " on channel %u", session, probe.id, MAC2STR(probeMac), probeChannel);
 }
 
 void Dongle::deselect(const bool tellProbe)
 {
 	if (!selected)
 		return;
+	/* What still waits for the probe belongs to the session */
+	dropPacketsTo(probeMac);
 	if (tellProbe)
 		sendToProbe(EspNowLink::Kind::CLOSE, nullptr, 0);
 	selected = false;
@@ -577,22 +635,36 @@ uint16_t Dongle::limit() const
 
 bool Dongle::sendToProbe(const EspNowLink::Kind kind, const uint8_t* const frame, const size_t length)
 {
-	const EspNowLink::Header header = {kind, session, kind == EspNowLink::Kind::DATA ? txSeq : static_cast<uint16_t>(0), limit()};
-	if (!queuePacket(probeMac, header, frame, length))
+	/* A PING tells the last DATA, so a probe that does not know the session tells it from one not started yet */
+	uint16_t seq = 0;
+	if (kind == EspNowLink::Kind::DATA)
+		seq = txSeq;
+	else if (kind == EspNowLink::Kind::PING)
+		seq = lastDataSeq;
+	const EspNowLink::Header header = {kind, session, seq, limit(), 0};
+	if (!queuePacket(probeMac, probeChannel, header, frame, length, kind == EspNowLink::Kind::CLOSE))
 		return false;
 	if (kind == EspNowLink::Kind::DATA)
-		txSeq++;
+	{
+		lastDataSeq = txSeq;
+		txSeq = static_cast<uint16_t>(txSeq + 1);
+		if (txSeq == 0)
+			txSeq = 1;
+	}
 	advertisedLimit = header.limit;
 	lastSendUs = esp_timer_get_time();
 	return true;
 }
 
-bool Dongle::queuePacket(const uint8_t* const mac, const EspNowLink::Header& header, const uint8_t* const frame, const size_t length)
+bool Dongle::queuePacket(const uint8_t* const mac, const uint8_t channel, EspNowLink::Header header, const uint8_t* const frame, const size_t length, const bool once)
 {
 	if (txCount == txQueueSize)
 		return false;
 	Outgoing& packet = txQueue[(txHead + txCount) % txQueueSize];
 	memcpy(packet.mac, mac, sizeof(packet.mac));
+	packet.channel = channel;
+	packet.once = once;
+	header.channel = channel;
 	EspNowLink::encodeHeader(packet.data, header);
 	if (length)
 		memcpy(packet.data + EspNowLink::headerSize, frame, length);
@@ -609,32 +681,50 @@ void Dongle::serviceTx()
 		const TxState state = txState;
 		if (state == TxState::inFlight)
 			return;
+		const Outgoing& packet = txQueue[txHead];
 		if (txFrontSent)
 		{
-			if (state == TxState::idle || txResends == EspNowLink::maxResends)
+			if (state == TxState::quiet)
 			{
-				/* Through, or given up */
-				if (state == TxState::failed)
-					txLost++;
-				txState = TxState::idle;
-				txHead = (txHead + 1) % txQueueSize;
-				txCount--;
-				txFrontSent = false;
-				continue;
+				if (esp_timer_get_time() < quietUntilUs)
+					return;
+			}
+			else
+			{
+				/* A resend goes at the rung the failure leaves, and at the lowest one after a pause */
+				if (state != TxState::noBuffer)
+					learnRate(packet.mac, state == TxState::idle);
+				if (state == TxState::idle && !memcmp(packet.mac, probeMac, sizeof(probeMac)))
+					quietReported = false;
+				if (state == TxState::idle || txResends == EspNowLink::maxResends || (packet.once && state == TxState::failed))
+				{
+					/* Through, or given up */
+					if (state != TxState::idle)
+						txLost++;
+					txState = TxState::idle;
+					txHead = (txHead + 1) % txQueueSize;
+					txCount--;
+					txFrontSent = false;
+					continue;
+				}
+				if (state == TxState::failed && startQuiet(packet))
+					return;
 			}
 			txResends++;
 		}
 		else
 			txResends = 0;
 
-		const Outgoing& packet = txQueue[txHead];
+		/* Only now, with nothing in the air */
+		setChannel(packet.channel);
 		txFrontSent = true;
 		txState = TxState::inFlight;
+		txStartUs = esp_timer_get_time();
 		const esp_err_t result = esp_now_send(packet.mac, packet.data, packet.length);
 		if (result == ESP_OK)
 			return;
-		/* Out of buffers: it counts as a failed try, the next round goes again */
-		txState = TxState::failed;
+		/* Out of buffers: it counts as a try, the next round goes again; refused: it is given up */
+		txState = TxState::noBuffer;
 		if (result != ESP_ERR_ESPNOW_NO_MEM)
 		{
 			ESP_LOGW(tag, "esp_now_send(): %s", esp_err_to_name(result));
@@ -642,6 +732,108 @@ void Dongle::serviceTx()
 		}
 		return;
 	}
+}
+
+bool Dongle::startQuiet(const Outgoing& packet)
+{
+	if (!selected || memcmp(packet.mac, probeMac, sizeof(probeMac)) || !ladder.atBottom())
+		return false;
+	const int64_t tryUs = txEndUs.load() - txStartUs;
+	const int64_t pauseUs = EspNowLink::quietUs(tryUs);
+	quietUntilUs = esp_timer_get_time() + pauseUs;
+	txState = TxState::quiet;
+	if (!quietReported)
+	{
+		ESP_LOGW(tag, "no acknowledgement from the probe at %s (the try took %lld ms): one try every %lld ms until it is heard", EspNowLink::rates[ladder.getRung()].name, static_cast<long long>(tryUs / 1000), static_cast<long long>((tryUs + pauseUs) / 1000));
+		quietReported = true;
+	}
+	return true;
+}
+
+void Dongle::dropPacketsTo(const uint8_t* const mac)
+{
+	size_t kept = 0;
+	for (size_t i = 0; i < txCount; ++i)
+	{
+		const size_t from = (txHead + i) % txQueueSize;
+		const bool inAir = i == 0 && txFrontSent && txState == TxState::inFlight;
+		if (!inAir && !memcmp(txQueue[from].mac, mac, sizeof(txQueue[from].mac)))
+		{
+			/* A front packet waiting to go again is given up */
+			if (i == 0 && txFrontSent)
+			{
+				txFrontSent = false;
+				txState = TxState::idle;
+			}
+			continue;
+		}
+		/* The radio has it: it is not sent again */
+		if (inAir && !memcmp(txQueue[from].mac, mac, sizeof(txQueue[from].mac)))
+			txResends = EspNowLink::maxResends;
+		const size_t to = (txHead + kept) % txQueueSize;
+		if (to != from)
+			txQueue[to] = txQueue[from];
+		kept++;
+	}
+	txCount = kept;
+}
+
+void Dongle::setChannel(const uint8_t wanted)
+{
+	if (wanted == channel)
+		return;
+	const esp_err_t result = esp_wifi_set_channel(wanted, WIFI_SECOND_CHAN_NONE);
+	if (result == ESP_OK)
+		channel = wanted;
+	else
+		ESP_LOGW(tag, "channel %u: %s", wanted, esp_err_to_name(result));
+}
+
+void Dongle::learnRate(const uint8_t* const mac, const bool acknowledged)
+{
+	/* Broadcasts get no acknowledgement, and keep 1 Mb/s for range */
+	if (!selected || memcmp(mac, probeMac, sizeof(probeMac)) || !ladder.update(acknowledged, esp_timer_get_time()))
+		return;
+	const uint8_t rung = ladder.getRung();
+	const esp_err_t result = EspNowLink::setPeerRate(probeMac, rung);
+	if (result == ESP_OK)
+		ESP_LOGI(tag, "sending to the probe at %s", EspNowLink::rates[rung].name);
+	else
+		ESP_LOGW(tag, "rate %s: %s", EspNowLink::rates[rung].name, esp_err_to_name(result));
+}
+
+void Dongle::startSweep(const uint8_t* const frame, const size_t length)
+{
+	memcpy(sweepFrame, frame, length);
+	sweepLength = length;
+	sweepChannel = firstChannel;
+	sweepCopy = 0;
+	sweepNextUs = 0;
+	serviceSweep();
+}
+
+void Dongle::serviceSweep()
+{
+	if (!sweepChannel)
+		return;
+	const int64_t now = esp_timer_get_time();
+	if (now < sweepNextUs)
+		return;
+	if (sweepCopy == sweepCopies)
+	{
+		/* The answers had their time: the next channel, or the sweep is over */
+		sweepCopy = 0;
+		if (sweepChannel == lastChannel)
+		{
+			sweepChannel = 0;
+			return;
+		}
+		sweepChannel++;
+	}
+	/* A full queue skips a copy */
+	queuePacket(broadcastMac, sweepChannel, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0}, sweepFrame, sweepLength);
+	sweepCopy++;
+	sweepNextUs = now + sweepDwellMs * 1000LL / sweepCopies;
 }
 
 void Dongle::serviceSession()
