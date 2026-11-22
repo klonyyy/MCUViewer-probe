@@ -16,8 +16,9 @@
  * one at a time, as EspNowLink asks: a session packet the radio got no acknowledgement for goes again, from service(),
  * after a quiet pause at the lowest rate that a packet from its peer cuts short; an answer outside a session and a
  * CLOSE do not. Peers are added as they are sent to, and each has a rate ladder (EspNowRate.hpp), which the outcome of
- * every session packet to it moves. ESP-NOW only runs while Wi-Fi does, so the Wi-Fi task suspends the port around
- * stopping Wi-Fi.
+ * every session packet to it moves; broadcasts go at the base rate. The paired dongles are pinned: encrypted peers that
+ * stay, so their packets can be decrypted before the probe ever sends to them. ESP-NOW only runs while Wi-Fi does, so
+ * the Wi-Fi task suspends the port around stopping Wi-Fi; the pinned peers come back after it.
  *
  * There is one port, so the class is a set of static functions.
  */
@@ -84,6 +85,22 @@ class EspNowPort
 	 * @brief The session ended: a packet of it waiting to go again is dropped, and one in the air is not sent again.
 	 */
 	static void abandon();
+
+	/**
+	 * @brief Makes mac an encrypted peer with lmk, for good: a paired dongle.
+	 * @return False when ESP-NOW refused it.
+	 */
+	static bool pin(const uint8_t* mac, const uint8_t* lmk);
+
+	/**
+	 * @brief Makes a pinned peer an ordinary one again: the dongle was forgotten.
+	 */
+	static void unpin(const uint8_t* mac);
+
+	/**
+	 * @return This probe's MAC address on ESP-NOW.
+	 */
+	static const uint8_t* getOwnMac();
 
 	/**
 	 * @brief Sends a packet: the link header, then frame, which may be empty. The header's channel is filled in: the

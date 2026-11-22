@@ -15,6 +15,7 @@
 
 #include "EspNowPort.hpp"
 #include "EspNowRate.hpp"
+#include "Pairing.hpp"
 #include "StatusLed.hpp"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -338,7 +339,7 @@ void Wifi::startField()
 	ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 	wifiStarted = true;
 	parkRadio();
-	ESP_LOGI(tag, "field mode: no network, ESP-NOW alone on channel %u; hold the setup button for %lu s to leave it", fieldChannel, static_cast<unsigned long>(buttonHoldMs / 1000));
+	ESP_LOGI(tag, "field mode: no network, ESP-NOW alone on channel %u; hold the setup button for %lu s and let go to leave it", fieldChannel, static_cast<unsigned long>(buttonHoldMs / 1000));
 	xEventGroupSetBits(events, readyBit);
 }
 
@@ -771,30 +772,83 @@ void Wifi::startButton()
 void Wifi::pollButton(const int64_t now)
 {
 #if CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO >= 0
-	if (gpio_get_level(static_cast<gpio_num_t>(CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO)) != 0)
-		buttonPressedAt = 0;
-	else if (!buttonPressedAt)
+	const bool down = gpio_get_level(static_cast<gpio_num_t>(CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO)) == 0;
+	if (down && !buttonPressedAt && now - buttonReleasedAt >= static_cast<int64_t>(buttonLockoutMs) * 1000)
 		buttonPressedAt = now;
-	else if (now - buttonPressedAt >= static_cast<int64_t>(buttonHoldMs) * 1000)
+	if (buttonPressedAt)
 	{
-		if (fieldMode)
+		const int64_t heldMs = (now - buttonPressedAt) / 1000;
+		if (!down)
 		{
-			ESP_LOGW(tag, "setup button held: leaving field mode and restarting; the saved networks stay");
-			RadioSettings settings = getRadio();
-			settings.fieldMode = false;
-			if (!settings.save())
-				ESP_LOGE(tag, "saving the radio settings failed");
+			buttonPressedAt = 0;
+			buttonReleasedAt = now;
+			StatusLed::setButtonHold(StatusLed::Hold::none);
+			onButtonReleased(heldMs, now);
 		}
+		else if (heldMs >= eraseHoldMs)
+			StatusLed::setButtonHold(StatusLed::Hold::erase);
+		else if (heldMs >= buttonHoldMs)
+			StatusLed::setButtonHold(StatusLed::Hold::networks);
 		else
-		{
-			ESP_LOGW(tag, "setup button held: forgetting the saved networks and restarting");
-			SavedNetworks::erase();
-		}
-		esp_restart();
+			StatusLed::setButtonHold(StatusLed::Hold::counting, buttonHoldMs - static_cast<uint32_t>(heldMs));
 	}
-	StatusLed::setButtonHold(buttonPressedAt ? buttonHoldMs - static_cast<uint32_t>((now - buttonPressedAt) / 1000) : 0);
+	if (eraseArmedUntil && now >= eraseArmedUntil)
+	{
+		eraseArmedUntil = 0;
+		StatusLed::setEraseArmed(false);
+		ESP_LOGI(tag, "no short press within %lu s: the pairings stay", static_cast<unsigned long>(eraseConfirmMs / 1000));
+	}
 	buttonDeadline.arm(buttonPollMs);
 #endif
+}
+
+void Wifi::onButtonReleased(const int64_t heldMs, const int64_t now)
+{
+	if (heldMs < shortPressMaxMs)
+	{
+		if (!eraseArmedUntil)
+		{
+			/* The net task tells whether a pairing request waited for it */
+			Pairing::notifyPress();
+			return;
+		}
+		eraseArmedUntil = 0;
+		StatusLed::setEraseArmed(false);
+		ESP_LOGW(tag, "setup button: erase of every pairing confirmed");
+		Pairing::notifyErase();
+		return;
+	}
+	if (heldMs >= eraseHoldMs)
+	{
+		eraseArmedUntil = now + static_cast<int64_t>(eraseConfirmMs) * 1000;
+		StatusLed::setEraseArmed(true);
+		ESP_LOGW(tag, "setup button held for %lld s: press it briefly within %lu s to forget every paired dongle", static_cast<long long>(heldMs / 1000), static_cast<unsigned long>(eraseConfirmMs / 1000));
+		return;
+	}
+	if (heldMs >= buttonHoldMs)
+	{
+		leaveFieldOrForget();
+		return;
+	}
+	ESP_LOGI(tag, "setup button released after %lld ms: nothing to do (3 s: %s, 10 s: forget the paired dongles)", static_cast<long long>(heldMs), fieldMode ? "leave field mode" : "forget the networks");
+}
+
+void Wifi::leaveFieldOrForget()
+{
+	if (fieldMode)
+	{
+		ESP_LOGW(tag, "setup button held: leaving field mode and restarting; the saved networks stay");
+		RadioSettings settings = getRadio();
+		settings.fieldMode = false;
+		if (!settings.save())
+			ESP_LOGE(tag, "saving the radio settings failed");
+	}
+	else
+	{
+		ESP_LOGW(tag, "setup button held: forgetting the saved networks and restarting; the paired dongles stay");
+		SavedNetworks::erase();
+	}
+	esp_restart();
 }
 
 void Wifi::Deadline::arm(const uint32_t ms)

@@ -122,6 +122,7 @@ void NetServer::start(HostLink& hostLink, const int gdbListen, SwoCapture& swoCa
 	ESP_LOGI(tag, "NETWORK PROBE protocol listening on TCP port %d, id %s", CONFIG_NETWORK_PROBE_PORT, probeId);
 	openDiscoverySocket();
 	EspNowPort::start(link->netWakeFd);
+	pairing.start(link->netWakeFd);
 	xTaskCreatePinnedToCore(taskEntry, "net", taskStackSize, this, taskPriority, nullptr, taskCore);
 }
 
@@ -141,6 +142,7 @@ void NetServer::run()
 		swo->poll();
 		EspNowPort::service();
 		serviceEspNow();
+		servicePairing(esp_timer_get_time());
 		if (hasClient() && !pumpTx())
 			closeClient();
 
@@ -182,7 +184,7 @@ void NetServer::run()
 		const bool samplesMayCome = hasClient() && (link->streaming.load(std::memory_order_acquire) || link->ring.available() > 0 || swo->isCapturing());
 		timeval timeout = {};
 		timeout.tv_usec = (samplesMayCome ? pollMs : sessionPollMs) * 1000U;
-		const bool timed = samplesMayCome || client == Client::espnow;
+		const bool timed = samplesMayCome || client == Client::espnow || pairing.isBusy();
 		const int ready = select(maxSocket + 1, &readSet, &writeSet, nullptr, timed ? &timeout : nullptr);
 		if (ready < 0)
 		{
@@ -270,9 +272,15 @@ void NetServer::closeClient(const bool tellPeer)
 		/* Once: a dongle that misses it gets a CLOSE for its next packet (refuseSession()) */
 		EspNowPort::abandon();
 		if (tellPeer)
-			EspNowPort::send(espnowPeer, {EspNowLink::Kind::CLOSE, espnowSession, 0, 0, 0}, nullptr, 0, true);
+		{
+			EspNowLink::Header header = {EspNowLink::Kind::CLOSE, espnowSession, 0, 0, 0, {}};
+			espnowAuth.stamp(header);
+			EspNowPort::send(espnowPeer, header, nullptr, 0, true);
+		}
 		memcpy(endedPeer, espnowPeer, sizeof(endedPeer));
 		endedSession = espnowSession;
+		/* A dongle forgotten during the session is an ordinary peer from now on */
+		pairing.releaseForgotten();
 		wifi->holdRadio(0);
 		link->radioRate.store(0, std::memory_order_relaxed);
 		link->radioRssi.store(0, std::memory_order_relaxed);
@@ -343,7 +351,7 @@ void NetServer::answerDatagram()
 	NetworkProbe::FrameHeader header;
 	if (!checkFrame(request, static_cast<size_t>(received), header))
 		return;
-	const size_t length = answerDiscovery(header, request + NetworkProbe::headerSize);
+	const size_t length = answerDiscovery(header, request + NetworkProbe::headerSize, nullptr);
 	if (!length)
 		return;
 	/* Non-blocking: with the send buffer full the answer is dropped, and the host asks again */
@@ -364,12 +372,12 @@ bool NetServer::checkFrame(const uint8_t* const data, const size_t length, Netwo
 	return NetworkProbe::getU32(data + NetworkProbe::headerSize + header.length) == esp_rom_crc32_le(0, data, NetworkProbe::headerSize + header.length);
 }
 
-size_t NetServer::answerDiscovery(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
+size_t NetServer::answerDiscovery(const NetworkProbe::FrameHeader& header, const uint8_t* const payload, const uint8_t* const dongleMac)
 {
 	uint8_t* const frame = discoveryFrame.data();
 	uint16_t dataLength = 0;
 	if (header.type == NetworkProbe::Type::DISCOVER && header.length == NetworkProbe::discoverRequestSize)
-		dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize);
+		dataLength = buildDiscover(frame + NetworkProbe::headerSize + NetworkProbe::respHeaderSize, dongleMac);
 	else if (header.type == NetworkProbe::Type::IDENTIFY && header.length == 1U + payload[0] && payload[0] == strlen(probeId) && !memcmp(payload + 1, probeId, payload[0]))
 		StatusLed::identify();
 	else
@@ -407,71 +415,130 @@ void NetServer::handlePacket(const EspNowPort::Packet& packet)
 	EspNowLink::Header linkHeader;
 	if (!EspNowLink::decodeHeader(packet.data, packet.length, linkHeader))
 		return;
-	/* Off: no answers and no sessions; a dongle that still holds one learns that it ended */
+	if (linkHeader.session == EspNowLink::noSession)
+	{
+		/* Off: no answers, no pairing */
+		if (wifi->isEspNowEnabled() && EspNowLink::isFor(linkHeader, EspNowPort::getOwnMac()))
+			handleUnsessioned(packet, linkHeader);
+		return;
+	}
+	if (linkHeader.kind == EspNowLink::Kind::PAIR)
+		return;
+	/* Off: no sessions; a dongle that still holds one learns that it ended */
 	if (!wifi->isEspNowEnabled())
 	{
-		if (linkHeader.session != EspNowLink::noSession && linkHeader.kind != EspNowLink::Kind::CLOSE)
-			refuseSession(packet.mac, linkHeader.session);
+		refuseIfAuthentic(packet, linkHeader, pairing.findKey(packet.mac), "ESP-NOW is off");
 		return;
 	}
 	const bool current = client == Client::espnow && linkHeader.session == espnowSession && !memcmp(packet.mac, espnowPeer, sizeof(espnowPeer));
-	if (current)
+	if (!current)
 	{
-		espnowLastRx = esp_timer_get_time();
-		espnowLimit = linkHeader.limit;
-		/* For GET_STATUS, which may be this very packet */
-		link->radioRssi.store(packet.rssi, std::memory_order_relaxed);
-		link->radioRate.store(EspNowPort::getRate(packet.mac), std::memory_order_relaxed);
-	}
-	else if (linkHeader.session != EspNowLink::noSession && !mayOpenSession(packet, linkHeader))
-	{
-		/* The dongle missed the end of its session, or this probe restarted since: it learns of it now */
-		if (linkHeader.kind != EspNowLink::Kind::CLOSE)
-			refuseSession(packet.mac, linkHeader.session);
-		return;
-	}
-
-	if (linkHeader.kind == EspNowLink::Kind::PING)
-		return;
-	if (linkHeader.kind == EspNowLink::Kind::CLOSE)
-	{
-		if (current)
-		{
-			ESP_LOGI(tag, "the ESP-NOW client closed the session");
-			closeClient(false);
-		}
+		handleOtherSession(packet, linkHeader);
 		return;
 	}
 
 	const uint8_t* const frame = packet.data + EspNowLink::headerSize;
 	NetworkProbe::FrameHeader header;
+	if (linkHeader.kind == EspNowLink::Kind::DATA && !checkFrame(frame, packet.length - EspNowLink::headerSize, header))
+		return;
+	/* With a pairing, a packet without the session's tag is someone else's, sent as the dongle */
+	EspNowLink::SessionAuth::Verdict verdict = EspNowLink::SessionAuth::Verdict::take;
+	if (linkHeader.kind == EspNowLink::Kind::DATA)
+		verdict = espnowAuth.checkData(linkHeader);
+	else if (!espnowAuth.checkControl(linkHeader))
+		verdict = EspNowLink::SessionAuth::Verdict::drop;
+	if (verdict == EspNowLink::SessionAuth::Verdict::drop)
+	{
+		if (!espnowDropReported)
+			ESP_LOGW(tag, "dropped a packet of ESP-NOW session %u: its tag or sequence number is wrong, someone else may be sending as " MACSTR, espnowSession, MAC2STR(packet.mac));
+		espnowDropReported = true;
+		return;
+	}
+
+	espnowLastRx = esp_timer_get_time();
+	espnowLimit = linkHeader.limit;
+	/* For GET_STATUS, which may be this very packet */
+	link->radioRssi.store(packet.rssi, std::memory_order_relaxed);
+	link->radioRate.store(EspNowPort::getRate(packet.mac), std::memory_order_relaxed);
+
+	if (linkHeader.kind == EspNowLink::Kind::CLOSE)
+	{
+		ESP_LOGI(tag, "the ESP-NOW client closed the session");
+		closeClient(false);
+		return;
+	}
+	/* A PING, or a resend whose first copy came through */
+	if (linkHeader.kind != EspNowLink::Kind::DATA || verdict == EspNowLink::SessionAuth::Verdict::repeat)
+		return;
+	if (!handleFrame(header, frame + NetworkProbe::headerSize))
+		closeClient();
+}
+
+void NetServer::handleUnsessioned(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader)
+{
+	if (linkHeader.kind == EspNowLink::Kind::PAIR)
+	{
+		if (pairing.handlePacket(packet.mac, packet.data + EspNowLink::headerSize, packet.length - EspNowLink::headerSize, esp_timer_get_time()))
+			onPaired(packet.mac);
+		return;
+	}
+	if (linkHeader.kind != EspNowLink::Kind::DATA)
+		return;
+
+	const uint8_t* const frame = packet.data + EspNowLink::headerSize;
+	NetworkProbe::FrameHeader header;
 	if (!checkFrame(frame, packet.length - EspNowLink::headerSize, header))
 		return;
-	const uint8_t* const payload = frame + NetworkProbe::headerSize;
+	const size_t length = answerDiscovery(header, frame + NetworkProbe::headerSize, packet.mac);
+	/* Not while the station looks for a network: the dongle would take the channel of the moment for the probe's */
+	if (!length || wifi->isRoaming())
+		return;
+	/*
+	 * A broadcast addressed to the dongle, which reads it whatever its pairing. It goes once, and with a packet in the
+	 * air not at all: the host asks again
+	 */
+	EspNowLink::Header answer = {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0, {}};
+	EspNowLink::addressTo(answer, packet.mac);
+	EspNowPort::send(EspNowLink::broadcastMac, answer, discoveryFrame.data(), length);
+	if (header.type == NetworkProbe::Type::IDENTIFY)
+		ESP_LOGI(tag, "identifying, as " MACSTR " asked", MAC2STR(packet.mac));
+}
 
-	if (linkHeader.session == EspNowLink::noSession)
+void NetServer::handleOtherSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader)
+{
+	const uint8_t* const pairKey = pairing.findKey(packet.mac);
+	if (!pairKey && pairing.isLocked())
 	{
-		const size_t length = answerDiscovery(header, payload);
-		/* Not while the station looks for a network: the dongle would take the channel of the moment for the probe's */
-		if (length && !wifi->isRoaming())
-		{
-			/* It goes once, and with a packet in the air not at all: the host asks again */
-			EspNowPort::send(packet.mac, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0}, discoveryFrame.data(), length);
-			if (header.type == NetworkProbe::Type::IDENTIFY)
-				ESP_LOGI(tag, "identifying, as " MACSTR " asked", MAC2STR(packet.mac));
-		}
+		refuseIfAuthentic(packet, linkHeader, nullptr, "the probe takes its paired dongles only");
 		return;
 	}
-	if (current)
+	if (!mayOpenSession(packet, linkHeader))
 	{
-		/* A resend whose first copy came through */
-		if (linkHeader.seq == espnowRxSeq)
-			return;
-		espnowRxSeq = linkHeader.seq;
+		/* The dongle missed the end of its session, or this probe restarted since: it learns of it now */
+		refuseIfAuthentic(packet, linkHeader, pairKey, "ended, or before a restart");
+		return;
 	}
-	else
-		openEspNowSession(packet, linkHeader);
-	if (!handleFrame(header, payload))
+	/* A PING before the first DATA of a new session: the DATA starts it */
+	if (linkHeader.kind != EspNowLink::Kind::DATA)
+		return;
+
+	const uint8_t* const frame = packet.data + EspNowLink::headerSize;
+	NetworkProbe::FrameHeader header;
+	if (!checkFrame(frame, packet.length - EspNowLink::headerSize, header))
+		return;
+	EspNowLink::SessionAuth auth;
+	if (!pairKey)
+		auth.startOpen();
+	else if (!auth.startPaired(pairKey, linkHeader.session, EspNowLink::Direction::toDongle))
+		return;
+	/* With a pairing, only the dongle makes the tag of the first DATA */
+	if (auth.checkData(linkHeader) != EspNowLink::SessionAuth::Verdict::take)
+	{
+		ESP_LOGW(tag, "a session start from " MACSTR " has the wrong tag: dropped", MAC2STR(packet.mac));
+		return;
+	}
+	openEspNowSession(packet, linkHeader, auth);
+	if (!handleFrame(header, frame + NetworkProbe::headerSize))
 		closeClient();
 }
 
@@ -482,19 +549,105 @@ bool NetServer::mayOpenSession(const EspNowPort::Packet& packet, const EspNowLin
 	return (linkHeader.kind == EspNowLink::Kind::DATA && linkHeader.seq == 1) || (linkHeader.kind == EspNowLink::Kind::PING && linkHeader.seq == 0);
 }
 
-void NetServer::refuseSession(const uint8_t* const mac, const uint16_t session)
+void NetServer::refuseIfAuthentic(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader, const uint8_t* const pairKey, const char* const why)
 {
+	if (linkHeader.kind == EspNowLink::Kind::CLOSE)
+		return;
+	if (pairKey)
+	{
+		EspNowLink::SessionAuth auth;
+		if (linkHeader.kind != EspNowLink::Kind::PING || !auth.startPaired(pairKey, linkHeader.session, EspNowLink::Direction::toDongle) || !auth.checkControl(linkHeader))
+			return;
+	}
+	refuseSession(packet.mac, linkHeader.session, pairKey, why);
+}
+
+void NetServer::refuseSession(const uint8_t* const mac, const uint16_t session, const uint8_t* const pairKey, const char* const why)
+{
+	EspNowLink::Header header = {EspNowLink::Kind::CLOSE, session, 0, 0, 0, {}};
+	if (pairKey)
+	{
+		EspNowLink::SessionAuth auth;
+		if (!auth.startPaired(pairKey, session, EspNowLink::Direction::toDongle))
+			return;
+		auth.stamp(header);
+	}
 	if (session != refusedSession || memcmp(mac, refusedPeer, sizeof(refusedPeer)))
 	{
-		ESP_LOGW(tag, "ESP-NOW session %u of " MACSTR " is not served here (ended, or before a restart): telling it to close", session, MAC2STR(mac));
+		ESP_LOGW(tag, "ESP-NOW session %u of " MACSTR " is not served here (%s): telling it to close", session, MAC2STR(mac), why);
 		refusedSession = session;
 		memcpy(refusedPeer, mac, sizeof(refusedPeer));
 	}
 	/* With a packet in the air it is not sent: the dongle's next packet asks again */
-	EspNowPort::send(mac, {EspNowLink::Kind::CLOSE, session, 0, 0, 0}, nullptr, 0, true);
+	EspNowPort::send(mac, header, nullptr, 0, true);
 }
 
-void NetServer::openEspNowSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader)
+void NetServer::servicePairing(const int64_t now)
+{
+	if (Pairing::takeErase())
+	{
+		if (client == Client::espnow && espnowAuth.isPaired())
+		{
+			ESP_LOGI(tag, "the pairings are erased: the ESP-NOW session ends");
+			closeClient();
+		}
+		pairing.eraseAll();
+	}
+	if (Pairing::takePress())
+	{
+		/* A dongle asking for pairing ended its session first; here it may not have ended yet */
+		const uint8_t* const waiting = pairing.getWaitingDongle();
+		if (waiting && client == Client::espnow && !memcmp(waiting, espnowPeer, sizeof(espnowPeer)))
+			closeClient(false);
+		pairing.confirm(now);
+	}
+	pairing.service(now);
+}
+
+void NetServer::onPaired(const uint8_t* const mac)
+{
+	if (client != Client::espnow)
+		return;
+	if (!memcmp(mac, espnowPeer, sizeof(espnowPeer)))
+		closeClient(false);
+	else if (!espnowAuth.isPaired())
+	{
+		ESP_LOGI(tag, "the probe is paired now: the session of unpaired dongle " MACSTR " ends", MAC2STR(espnowPeer));
+		closeClient();
+	}
+}
+
+bool NetServer::handlePairingRequest(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
+{
+	if (client != Client::espnow || !espnowAuth.isPaired())
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::NOT_PAIRED, 0);
+	uint8_t* const data = localData();
+	if (header.type == NetworkProbe::Type::PAIRINGS)
+	{
+		if (header.length != 0)
+			return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::MALFORMED, 0);
+		const size_t count = pairing.getCount();
+		data[0] = static_cast<uint8_t>(count);
+		for (size_t i = 0; i < count; ++i)
+		{
+			uint8_t* const entry = data + 1 + i * NetworkProbe::pairingEntrySize;
+			memcpy(entry, pairing.getMac(i), NetworkProbe::macSize);
+			entry[NetworkProbe::macSize] = !memcmp(pairing.getMac(i), espnowPeer, NetworkProbe::macSize) ? NetworkProbe::pairingThisDongle : 0;
+		}
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::OK, static_cast<uint16_t>(1 + count * NetworkProbe::pairingEntrySize));
+	}
+
+	if (header.length != 0 && header.length != NetworkProbe::macSize)
+		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::MALFORMED, 0);
+	const uint8_t* const mac = header.length ? payload : espnowPeer;
+	const bool own = !memcmp(mac, espnowPeer, sizeof(espnowPeer));
+	ESP_LOGI(tag, "dongle " MACSTR " asks to forget %s" MACSTR, MAC2STR(espnowPeer), own ? "itself, " : "", MAC2STR(mac));
+	/* The session's dongle keeps its key until the session ends */
+	data[0] = pairing.forget(mac, own) ? 1 : 0;
+	return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::OK, 1);
+}
+
+void NetServer::openEspNowSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader, const EspNowLink::SessionAuth& auth)
 {
 	if (hasClient())
 	{
@@ -504,10 +657,11 @@ void NetServer::openEspNowSession(const EspNowPort::Packet& packet, const EspNow
 	memcpy(espnowPeer, packet.mac, sizeof(espnowPeer));
 	const uint16_t session = linkHeader.session;
 	espnowSession = session;
-	espnowRxSeq = linkHeader.seq;
-	espnowTxSeq = 1;
+	espnowAuth = auth;
+	espnowTxNumber = 1;
 	espnowLimit = linkHeader.limit;
 	espnowLastRx = esp_timer_get_time();
+	espnowDropReported = false;
 	/*
 	 * The dongle stays on the channel it says, where it found the probe: the station must not take the radio off it.
 	 * The packet may have come in elsewhere, through a channel next to it or in a scan.
@@ -518,14 +672,15 @@ void NetServer::openEspNowSession(const EspNowPort::Packet& packet, const EspNow
 	link->radioChannel.store(channel, std::memory_order_relaxed);
 	link->radioRssi.store(packet.rssi, std::memory_order_relaxed);
 	link->radioRate.store(EspNowPort::getRate(packet.mac), std::memory_order_relaxed);
+	const char* const kind = auth.isPaired() ? "paired, encrypted" : "unpaired";
 	if (channel == packet.channel)
-		ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected on channel %u, session %u", MAC2STR(packet.mac), channel, session);
+		ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected on channel %u, session %u (%s)", MAC2STR(packet.mac), channel, session, kind);
 	else
-		ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected on channel %u (heard on %u), session %u", MAC2STR(packet.mac), channel, packet.channel, session);
+		ESP_LOGI(tag, "ESP-NOW client " MACSTR " connected on channel %u (heard on %u), session %u (%s)", MAC2STR(packet.mac), channel, packet.channel, session, kind);
 	startSession(Client::espnow, EspNowLink::maxPayload);
 }
 
-uint16_t NetServer::buildDiscover(uint8_t* const data) const
+uint16_t NetServer::buildDiscover(uint8_t* const data, const uint8_t* const dongleMac) const
 {
 	NetworkProbe::Session session = NetworkProbe::Session::FREE;
 	if (link->gdbRequested.load(std::memory_order_acquire) || link->gdbActive.load(std::memory_order_acquire))
@@ -536,7 +691,7 @@ uint16_t NetServer::buildDiscover(uint8_t* const data) const
 	NetworkProbe::putU16(data, NetworkProbe::protocolVersion);
 	NetworkProbe::putU16(data + 2, CONFIG_NETWORK_PROBE_PORT);
 	data[4] = NetworkProbe::toByte(session);
-	data[5] = 0;
+	data[5] = NetworkProbe::toByte(pairing.stateFor(dongleMac));
 
 	char hostname[NetworkSettings::maxHostnameLength + 1];
 	wifi->getHostname(hostname, sizeof(hostname));
@@ -606,6 +761,8 @@ bool NetServer::handleFrame(const NetworkProbe::FrameHeader& header, const uint8
 	}
 	if (!isRequest(header.type))
 		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::UNSUPPORTED, 0);
+	if (header.type == NetworkProbe::Type::PAIRINGS || header.type == NetworkProbe::Type::UNPAIR)
+		return handlePairingRequest(header, payload);
 	if (link->gdbRequested.load(std::memory_order_acquire) || link->gdbActive.load(std::memory_order_acquire))
 		return queueLocalResponse(header.seq, header.type, NetworkProbe::Status::BUSY, 0);
 	if (requestOutstanding || link->slotState.load(std::memory_order_acquire) != HostLink::SlotState::empty)
@@ -733,7 +890,7 @@ bool NetServer::pumpTx()
 		if (txSent == txLength)
 		{
 			/* A packet carries a whole frame: take the next one only once it can go, and the dongle has room for it */
-			if (client == Client::espnow && (!EspNowPort::canSend() || !EspNowLink::allows(espnowLimit, espnowTxSeq)))
+			if (client == Client::espnow && (!EspNowPort::canSend() || !EspNowLink::allows(espnowLimit, static_cast<uint16_t>(espnowTxNumber))))
 				return true;
 			if (!nextFrame(now))
 				return true;
@@ -743,12 +900,14 @@ bool NetServer::pumpTx()
 		if (client == Client::espnow)
 		{
 			/* Busy keeps the frame for when a send callback, or the next select() timeout, wakes the task */
-			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, {EspNowLink::Kind::DATA, espnowSession, espnowTxSeq, 0, 0}, txFrame.data(), txLength);
+			EspNowLink::Header header = {EspNowLink::Kind::DATA, espnowSession, static_cast<uint16_t>(espnowTxNumber), 0, 0, {}};
+			espnowAuth.stamp(header, espnowTxNumber);
+			const EspNowPort::SendResult result = EspNowPort::send(espnowPeer, header, txFrame.data(), txLength);
 			if (result == EspNowPort::SendResult::busy)
 				return true;
 			if (result == EspNowPort::SendResult::failed)
 				return false;
-			espnowTxSeq++;
+			espnowTxNumber++;
 			txSent = txLength;
 			continue;
 		}

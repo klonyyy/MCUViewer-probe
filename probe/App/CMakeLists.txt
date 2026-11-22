@@ -9,6 +9,7 @@ idf_component_register(
         GdbServer.cpp
         NetServer.cpp
         NetworkSettings.cpp
+        Pairing.cpp
         ProbeService.cpp
         SetupPortal.cpp
         StatusLed.cpp

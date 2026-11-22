@@ -24,13 +24,15 @@ namespace
 {
 constexpr const char* tag = "espnow_port";
 constexpr uint32_t poolSize = 12; /**< Packets the net task has not handled yet; more are dropped. */
-constexpr size_t maxPeers = 4;	  /**< Dongles sent to lately; the one unused longest makes room. */
+constexpr size_t maxPeers = 8;	  /**< Pinned dongles, and those sent to lately: the one unused longest makes room. */
 
 struct Peer
 {
 	uint8_t mac[6];
 	int64_t lastUse;
 	bool used;
+	bool pinned; /**< A paired dongle: encrypted with lmk, never makes room. */
+	uint8_t lmk[ESP_NOW_KEY_LEN];
 	EspNowLink::RateLadder ladder;
 };
 
@@ -66,6 +68,8 @@ std::atomic<int64_t> txEndUs{0};
 int64_t quietUntil = 0;
 bool quietReported = false; /**< Since the last acknowledgement. */
 Peer peers[maxPeers];
+uint8_t ownMac[6] = {};
+std::atomic<bool> repinNeeded{false}; /**< ESP-NOW started again without the pinned peers. */
 
 void wake()
 {
@@ -191,57 +195,81 @@ bool init()
 	return true;
 }
 
+bool isBroadcast(const uint8_t* const mac)
+{
+	return !memcmp(mac, EspNowLink::broadcastMac, sizeof(EspNowLink::broadcastMac));
+}
+
+/* Gives a peer to ESP-NOW as it is: encrypted when pinned, at its rung */
+bool applyPeer(const Peer& peer)
+{
+	esp_now_peer_info_t info = {};
+	memcpy(info.peer_addr, peer.mac, sizeof(info.peer_addr));
+	info.ifidx = WIFI_IF_STA;
+	info.encrypt = peer.pinned;
+	if (peer.pinned)
+		memcpy(info.lmk, peer.lmk, sizeof(info.lmk));
+	if (esp_now_is_peer_exist(peer.mac))
+		esp_now_del_peer(peer.mac);
+	esp_err_t result = esp_now_add_peer(&info);
+	/* Without it ESP-NOW sends at 1 Mb/s, where the acknowledgements get lost; broadcasts stay there, for range */
+	if (result == ESP_OK && !isBroadcast(peer.mac))
+		result = EspNowLink::setPeerRate(peer.mac, peer.ladder.getRung());
+	if (result != ESP_OK)
+		ESP_LOGW(tag, "cannot add peer " MACSTR "%s: %s", MAC2STR(peer.mac), peer.pinned ? " (encrypted)" : "", esp_err_to_name(result));
+	return result == ESP_OK;
+}
+
+/* The slot of mac, or a new one: free, else the one unused longest that is not pinned. A new one starts at the top of the ladder. */
+Peer* claimSlot(const uint8_t* const mac)
+{
+	if (Peer* const peer = findPeer(mac))
+		return peer;
+	Peer* slot = nullptr;
+	for (Peer& peer : peers)
+	{
+		if (peer.pinned)
+			continue;
+		if (!peer.used)
+		{
+			slot = &peer;
+			break;
+		}
+		if (!slot || peer.lastUse < slot->lastUse)
+			slot = &peer;
+	}
+	if (!slot)
+		return nullptr;
+	if (slot->used && running && esp_now_is_peer_exist(slot->mac))
+		esp_now_del_peer(slot->mac);
+	*slot = Peer{};
+	memcpy(slot->mac, mac, sizeof(slot->mac));
+	slot->used = true;
+	return slot;
+}
+
 /*
- * A peer for sending: added when it is not one (any more), the one unused longest making room. A new one starts at
- * the top of the ladder; one ESP-NOW forgot keeps its rung.
+ * A peer for sending: added when it is not one (any more). One ESP-NOW forgot keeps its rung, and a pinned one its
+ * key.
  */
 bool addPeer(const uint8_t* const mac)
 {
 	const int64_t now = esp_timer_get_time();
-	Peer* slot = nullptr;
-	for (Peer& peer : peers)
-		if (peer.used && !memcmp(peer.mac, mac, sizeof(peer.mac)))
-			slot = &peer;
-	if (slot && esp_now_is_peer_exist(mac))
+	Peer* const existing = findPeer(mac);
+	if (existing && esp_now_is_peer_exist(mac))
 	{
-		slot->lastUse = now;
+		existing->lastUse = now;
 		return true;
 	}
+	Peer* const slot = existing ? existing : claimSlot(mac);
 	if (!slot)
-	{
-		slot = &peers[0];
-		for (Peer& peer : peers)
-		{
-			if (!peer.used)
-			{
-				slot = &peer;
-				break;
-			}
-			if (peer.lastUse < slot->lastUse)
-				slot = &peer;
-		}
-		if (slot->used && esp_now_is_peer_exist(slot->mac))
-			esp_now_del_peer(slot->mac);
-		slot->ladder.reset();
-	}
-
-	esp_now_peer_info_t info = {};
-	memcpy(info.peer_addr, mac, sizeof(info.peer_addr));
-	info.ifidx = WIFI_IF_STA;
-	esp_err_t result = esp_now_is_peer_exist(mac) ? ESP_OK : esp_now_add_peer(&info);
-	/* Without it ESP-NOW sends at 1 Mb/s */
-	if (result == ESP_OK)
-		result = EspNowLink::setPeerRate(mac, slot->ladder.getRung());
-	if (result != ESP_OK)
-	{
-		ESP_LOGW(tag, "cannot add peer " MACSTR ": %s", MAC2STR(mac), esp_err_to_name(result));
-		slot->used = false;
 		return false;
-	}
-	memcpy(slot->mac, mac, sizeof(slot->mac));
 	slot->lastUse = now;
-	slot->used = true;
-	return true;
+	if (applyPeer(*slot))
+		return true;
+	if (!slot->pinned)
+		slot->used = false;
+	return false;
 }
 }  // namespace
 
@@ -257,9 +285,8 @@ void EspNowPort::start(const int fd)
 	started = true;
 	running = true;
 
-	uint8_t mac[6];
-	esp_read_mac(mac, ESP_MAC_WIFI_STA);
-	ESP_LOGI(tag, "ESP-NOW listening as " MACSTR, MAC2STR(mac));
+	esp_read_mac(ownMac, ESP_MAC_WIFI_STA);
+	ESP_LOGI(tag, "ESP-NOW listening as " MACSTR, MAC2STR(ownMac));
 }
 
 void EspNowPort::suspend()
@@ -273,8 +300,45 @@ void EspNowPort::suspend()
 
 void EspNowPort::resume()
 {
-	if (started && !running)
-		running = init();
+	if (!started || running)
+		return;
+	running = init();
+	/* The net task owns the peers: it gives the pinned ones back */
+	if (running)
+	{
+		repinNeeded = true;
+		wake();
+	}
+}
+
+bool EspNowPort::pin(const uint8_t* const mac, const uint8_t* const lmk)
+{
+	Peer* const slot = claimSlot(mac);
+	if (!slot)
+	{
+		ESP_LOGE(tag, "no room to pin " MACSTR, MAC2STR(mac));
+		return false;
+	}
+	slot->pinned = true;
+	memcpy(slot->lmk, lmk, sizeof(slot->lmk));
+	slot->lastUse = esp_timer_get_time();
+	return !running || applyPeer(*slot);
+}
+
+void EspNowPort::unpin(const uint8_t* const mac)
+{
+	Peer* const slot = findPeer(mac);
+	if (!slot || !slot->pinned)
+		return;
+	/* Added again as an ordinary peer once it is sent to */
+	if (running && esp_now_is_peer_exist(mac))
+		esp_now_del_peer(mac);
+	*slot = Peer{};
+}
+
+const uint8_t* EspNowPort::getOwnMac()
+{
+	return ownMac;
 }
 
 EspNowPort::Packet* EspNowPort::receive()
@@ -313,6 +377,12 @@ void EspNowPort::service()
 	}
 	if (!running)
 		return;
+	if (repinNeeded.exchange(false))
+	{
+		for (const Peer& peer : peers)
+			if (peer.pinned)
+				applyPeer(peer);
+	}
 	settle();
 	const TxState state = txState;
 	if (state == TxState::quiet && esp_timer_get_time() < quietUntil)

@@ -45,8 +45,13 @@ enum class Type : uint8_t
 	SWO_START = 0x13,
 	SWO_STOP = 0x14,
 	READ_BULK = 0x15, /* answered with READ_DATA frames, then the RESP */
-	DONGLE_SELECT = 0x40, /* answered by an ESP-NOW dongle itself: the probe to talk to */
-	DONGLE_STATUS = 0x41, /* answered by an ESP-NOW dongle itself: its side of the link to the selected probe */
+	PAIRINGS = 0x16,  /* the dongles paired with the probe; only through a paired dongle */
+	UNPAIR = 0x17,	  /* the probe forgets a dongle; only through a paired dongle */
+	DONGLE_SELECT = 0x40,	/* answered by an ESP-NOW dongle itself: the probe to talk to */
+	DONGLE_STATUS = 0x41,	/* answered by an ESP-NOW dongle itself: its side of the link to the selected probe */
+	DONGLE_PAIR = 0x42,		/* answered by an ESP-NOW dongle itself: pairs it with a probe, confirmed by its BOOT button */
+	DONGLE_UNPAIR = 0x43,	/* answered by an ESP-NOW dongle itself: it forgets a probe */
+	DONGLE_PAIRINGS = 0x44, /* answered by an ESP-NOW dongle itself: the probes paired with it */
 	RESP = 0x80,
 	DATA = 0x81,
 	EVENT = 0x82,
@@ -63,8 +68,32 @@ enum class Status : uint8_t
 	TARGET_ERROR = 4, /* data: u8 fault */
 	NO_TARGET = 5,
 	BUSY = 6,
-	NO_PROBE = 7, /* from a dongle: no probe selected, or none with the id DONGLE_SELECT names */
+	NO_PROBE = 7,		 /* from a dongle: no probe selected, or none with the id DONGLE_SELECT names */
+	NOT_PAIRED = 8,		 /* see Pairing below */
+	PAIRING_FAILED = 9,	 /* DONGLE_PAIR: data u8 PairFailure */
 };
+
+/* The pairing byte of a DISCOVER answer, see Pairing below */
+enum class Pairing : uint8_t
+{
+	OPEN = 0,	/* paired with no dongle: every dongle reaches it */
+	LOCKED = 1, /* paired, not with the dongle the answer came through (or the answer came over UDP) */
+	PAIRED = 2, /* paired with the dongle the answer came through */
+};
+
+/* Why DONGLE_PAIR failed */
+enum class PairFailure : uint8_t
+{
+	NO_ANSWER = 1,	 /* the probe did not answer: out of range, ESP-NOW off, or a firmware without pairing */
+	NO_PRESS = 2,	 /* nobody pressed the probe's BOOT button in time */
+	CONFLICT = 3,	 /* another dongle asked the probe for pairing at the same time: both were refused */
+	PROBE_FULL = 4,	 /* the probe is paired with maxPairedDongles dongles already */
+	DONGLE_FULL = 5, /* the dongle is paired with maxPairedProbes probes already */
+	MISMATCH = 6,	 /* the two sides did not agree on the key */
+	STORAGE = 7,	 /* the pairing could not be saved */
+};
+constexpr uint8_t maxPairedDongles = 4; /* per probe */
+constexpr uint8_t maxPairedProbes = 8;	/* per dongle */
 
 /* The fault byte of Status::TARGET_ERROR */
 enum class Fault : uint8_t
@@ -130,7 +159,10 @@ constexpr size_t readListEntrySize = 5;         /* u32 address, u8 size; the req
 constexpr size_t statusResponseSize = 16;       /* u8 link, u8 radio_rate, i8 radio_rssi, u8 radio_channel, u32 clock, u32 target_errors, u32 uptime_ms */
 constexpr size_t dongleStatusResponseSize = 3;  /* u8 radio_rate, i8 radio_rssi, u8 radio_channel */
 constexpr size_t discoverRequestSize = 2;       /* u16 protocol */
-constexpr size_t discoverResponseFixedSize = 6; /* u16 protocol, u16 tcp_port, u8 session, u8 reserved; name, firmware, id and hostname follow */
+constexpr size_t discoverResponseFixedSize = 6; /* u16 protocol, u16 tcp_port, u8 session, u8 pairing; name, firmware, id and hostname follow */
+constexpr size_t pairingEntrySize = 7;          /* PAIRINGS answer, after u8 count: u8 mac[6], u8 flags */
+constexpr uint8_t pairingThisDongle = 1U << 0;  /* PAIRINGS flags: the dongle the session goes through */
+constexpr size_t macSize = 6;
 constexpr size_t planHeaderSize = 7;            /* u16 plan_id, u32 period_us, u8 nblocks */
 constexpr size_t planBlockSize = 7;             /* u32 address, u16 count, u8 access_size */
 constexpr size_t dataHeaderSize = 10;           /* u16 plan_id, u32 first_sample, u16 nsamples, u16 bytes_per_sample */
@@ -168,6 +200,33 @@ constexpr uint32_t blockBoundary = 0x400;       /* a plan block must not cross a
  * radio_rate is the rate the side sends its packets at, in 0.5 Mb/s (22 is 11 Mb/s): each side picks its own and moves
  * it with the signal. radio_rssi is the signal of the last packet from the other side, in dBm, 0 before the first.
  * radio_channel is the Wi-Fi channel of the link.
+ */
+
+/*
+ * Pairing, over ESP-NOW only: TCP clients are not affected. A probe paired with no dongle is OPEN: every dongle reaches
+ * it. Once paired, it serves the dongles paired with it only, and their sessions are encrypted; a dongle paired with
+ * any probe talks to its paired probes only. Pairing is one-time per dongle and probe, and both keep it.
+ *
+ * DONGLE_PAIR carries the id of a probe that answered DISCOVER, as a string. The dongle ends its session, asks the
+ * probe, and the probe's LED blinks yellow for 30 s: a short press of its BOOT button confirms. The answer comes once
+ * it is done: OK, NO_PROBE, BUSY while another DONGLE_PAIR runs, or PAIRING_FAILED with u8 PairFailure. Pairing a pair
+ * again replaces its key.
+ *
+ * The pairing byte of a DISCOVER answer tells the host which probes the dongle reaches. DONGLE_SELECT answers
+ * NOT_PAIRED for a probe that is paired, but not with this dongle (LOCKED), for any probe not paired with this dongle
+ * while the dongle is paired with others, and for a probe the dongle is paired with that forgot the dongle (its
+ * answer does not say PAIRED): pair again, or forget it with DONGLE_UNPAIR.
+ *
+ * DONGLE_PAIRINGS, without payload, answers OK with u8 count, then for each probe u8 mac[6] and its id as a string.
+ * DONGLE_UNPAIR carries a probe's id as a string: the dongle forgets it, and ends the session with it; OK, or NO_PROBE
+ * when it was not paired. The probe still knows the dongle: tell it first with UNPAIR, while the session lasts.
+ *
+ * PAIRINGS and UNPAIR go to the probe, and only in the session of a paired dongle; other clients get NOT_PAIRED.
+ * PAIRINGS, without payload, answers OK with u8 count, then pairingEntrySize bytes for each dongle. UNPAIR carries the
+ * mac of a dongle, or nothing for the dongle of the session, and answers OK with u8 1 if the probe forgot it, 0 if it
+ * did not know it. A probe that forgets the dongle of the session serves the session to its end. A probe paired with
+ * no dongle any more is OPEN again. Without a paired dongle at hand, holding the probe's BOOT button for 10 s, then
+ * pressing it briefly within 5 s, forgets every dongle.
  */
 
 /* Header fields of a received frame. type holds whatever byte the sender put there, known or not. */

@@ -39,7 +39,12 @@
  *
  * Field mode (RadioSettings), chosen on the setup page, takes effect at the next start: the station starts but joins
  * nothing and scans for nothing, and its radio stays on the field channel for ESP-NOW alone; there is no access point
- * either. Holding the setup button leaves field mode and keeps the saved networks; out of field mode it forgets them.
+ * either.
+ *
+ * The setup (BOOT) button acts when it is let go, by how long it was held: a short press accepts a pairing request
+ * (Pairing); 3 to 10 s leaves field mode and keeps the saved networks, or out of field mode forgets them; from 10 s on
+ * it arms the erase of every pairing, which a short press within eraseConfirmMs confirms. Presses right after a release
+ * are ignored, so a bouncing contact does not confirm anything.
  *
  * The Wi-Fi task owns all of it: the Wi-Fi events and the setup page only queue commands for it, the setup button and
  * the timeouts are polled by it.
@@ -162,8 +167,12 @@ class Wifi
 	static constexpr uint32_t joinTimeoutMs = 45000;
 	static constexpr uint8_t maxJoinAttempts = 3; /**< A wrong password ends the join at the first one. */
 	static constexpr uint32_t restartDelayMs = 1000; /**< After the setup page turned field mode on: its answer goes first. */
-	static constexpr uint32_t buttonPollMs = 100;
-	static constexpr uint32_t buttonHoldMs = 3000;
+	static constexpr uint32_t buttonPollMs = 50;
+	static constexpr uint32_t shortPressMaxMs = 1000;  /**< A release before it: a short press. */
+	static constexpr uint32_t buttonHoldMs = 3000;	   /**< Released from here on: the networks, or field mode. */
+	static constexpr uint32_t eraseHoldMs = 10000;	   /**< Released from here on: the pairing erase is armed. */
+	static constexpr uint32_t eraseConfirmMs = 5000;   /**< For the short press that confirms the erase. */
+	static constexpr uint32_t buttonLockoutMs = 300;   /**< After a release: no new press, against contact bounce. */
 	static constexpr uint16_t maxScanRecords = 32;
 
 	enum class Command : uint8_t
@@ -261,6 +270,8 @@ class Wifi
 	void startMdns();
 	void startButton();
 	void pollButton(int64_t now);
+	void onButtonReleased(int64_t heldMs, int64_t now);
+	void leaveFieldOrForget();
 
 	SetupPortal portal{*this};
 	EventGroupHandle_t events = nullptr;
@@ -296,6 +307,8 @@ class Wifi
 	std::atomic<bool> ownScan{false}; /**< A scan for connectSaved(), which a hold stops. */
 	std::atomic<bool> espNowEnabled{true};
 	int64_t buttonPressedAt = 0;
+	int64_t buttonReleasedAt = 0;
+	int64_t eraseArmedUntil = 0; /**< The pairing erase waits for a short press until then; 0 when not armed. */
 	Deadline bootDeadline;
 	Deadline retryDeadline;
 	Deadline joinDeadline;

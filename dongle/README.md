@@ -2,10 +2,11 @@
 
 An ESP32-S3 on the PC's USB port that reaches probes over ESP-NOW, without a router. To the PC it is a serial
 port (USB CDC-ACM), which Windows, Linux and macOS drive without installing anything. Over it go the same NETWORK
-PROBE frames as over TCP, plus `DONGLE_SELECT`, which picks the probe to talk to, and `DONGLE_STATUS`, which tells
-the dongle's side of the radio link (see
-[NetworkProbeProto.hpp](../components/network_probe_proto/NetworkProbeProto.hpp)). The radio side is described in
-[EspNowLink.hpp](../components/espnow_link/EspNowLink.hpp).
+PROBE frames as over TCP, plus `DONGLE_SELECT`, which picks the probe to talk to, `DONGLE_STATUS`, which tells the
+dongle's side of the radio link, and `DONGLE_PAIR`, `DONGLE_UNPAIR` and `DONGLE_PAIRINGS` for [pairing](#pairing)
+(see [NetworkProbeProto.hpp](../components/network_probe_proto/NetworkProbeProto.hpp)). The radio side is described
+in [EspNowLink.hpp](../components/espnow_link/EspNowLink.hpp) and
+[EspNowPairing.hpp](../components/espnow_link/EspNowPairing.hpp).
 
 ```
 probe  <-- ESP-NOW -->  dongle  <-- USB serial port -->  PC
@@ -23,6 +24,7 @@ ESP32-S3-Pico. Its RGB LED (GPIO21 by default) shows what the dongle does:
 |---|---|
 | blue, short blinks | no session with a probe |
 | green | a session; it dips for the traffic |
+| yellow blinks | pairing with a probe |
 | one red flash | the probe ended the session: another client took over, or it heard nothing for 2 s |
 
 ## Building and flashing
@@ -36,6 +38,38 @@ idf.py -p <PORT> flash
 After the flash, the board's USB port stops being the ESP32-S3's own serial port: it comes back as a new one named
 *NETWORK PROBE ESP-NOW dongle*. To flash again, hold BOOT while plugging the board in, flash, then plug it in once
 more: the reset at the end of the flash leaves a board started with BOOT in download mode.
+
+Flashing keeps the pairings, which live in NVS; `idf.py erase-flash` erases them, and then the probes still know a
+dongle that no longer knows them: pair them again.
+
+## Pairing
+
+Out of the box any dongle reaches any probe. Pairing a dongle with a probe changes that for both:
+
+- the probe takes sessions from its paired dongles only (up to 4), and the dongle talks to its paired probes only
+  (up to 8);
+- their sessions are encrypted by the radio, and every packet carries a tag only the two can make, so nobody else can
+  send in their name or replay their packets.
+
+TCP clients are not affected: on the network, the probe serves anyone, as before.
+
+To pair, the host sends `DONGLE_PAIR` with the probe's id; the probe's LED blinks yellow for 30 s, and a short press
+of its BOOT button confirms. Nothing else does: the press is the proof that the dongle is yours. If another dongle asks
+the same probe during those 30 s, both are refused. Pairing a pair again gives it a new key. Each side keeps the
+pairing until it is told to forget it; a firmware update keeps it too.
+
+To unpair, the probe forgets the dongle first, in a session of that dongle (`UNPAIR`), then the dongle forgets the probe
+(`DONGLE_UNPAIR`). A paired dongle can also make the probe forget another dongle, a lost one say. Without any paired
+dongle at hand, hold the probe's BOOT button for 10 s and let go, then press it briefly within 5 s: it forgets every
+dongle and is open again.
+
+Until MCUViewer has a Pair button, a script does it:
+
+```
+python Tools/dongle_pair.py COM7 list
+python Tools/dongle_pair.py COM7 pair network-probe-a1b2c3
+python Tools/dongle_pair.py COM7 unpair network-probe-a1b2c3
+```
 
 ## Channels
 
@@ -90,7 +124,9 @@ seconds after the restart.
 
 ## Limits for now
 
-- No encryption or pairing: any dongle in range can talk to the probe, like any host on the network over TCP.
+- Unpaired, any dongle in range can talk to the probe, like any host on the network over TCP: pair them.
+- Pairing trusts whoever asks while the probe's LED blinks yellow: someone else in range at that moment could get in
+  between. Pair where you see who is around.
 - A packet that fails ten times is lost: a lost request or answer shows as a timeout on the host. At a usable signal
   that is rare, see [the bench results](../Tools/espnow_bench/RESULTS.md).
 - USB full speed limits the dongle to about 1 MB/s.

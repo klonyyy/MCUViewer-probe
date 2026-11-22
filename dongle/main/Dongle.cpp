@@ -17,6 +17,7 @@
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "tinyusb.h"
@@ -26,7 +27,10 @@
 namespace
 {
 constexpr const char* tag = "dongle";
-constexpr uint8_t broadcastMac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+constexpr const uint8_t* broadcastMac = EspNowLink::broadcastMac;
+constexpr const char* pairingNamespace = "pairing";
+constexpr const char* pairingKey = "probes";
+constexpr uint8_t pairingFormat = 1; /**< A later format converts this one, so pairings survive updates. */
 constexpr uint32_t ledTaskStackSize = 3072;
 constexpr uint32_t ledTaskPriority = 2;
 constexpr uint32_t ledPeriodMs = 50;
@@ -41,6 +45,28 @@ bool isRequest(const NetworkProbe::Type type)
 bool frameCrcMatches(const uint8_t* const frame, const uint16_t payloadLength)
 {
 	return NetworkProbe::getU32(frame + NetworkProbe::headerSize + payloadLength) == esp_rom_crc32_le(0, frame, NetworkProbe::headerSize + payloadLength);
+}
+
+const char* failureName(const NetworkProbe::PairFailure reason)
+{
+	switch (reason)
+	{
+		case NetworkProbe::PairFailure::NO_ANSWER:
+			return "the probe did not answer";
+		case NetworkProbe::PairFailure::NO_PRESS:
+			return "nobody pressed the probe's BOOT button in time";
+		case NetworkProbe::PairFailure::CONFLICT:
+			return "another dongle asked the probe at the same time";
+		case NetworkProbe::PairFailure::PROBE_FULL:
+			return "the probe is paired with the most dongles already";
+		case NetworkProbe::PairFailure::DONGLE_FULL:
+			return "this dongle is paired with the most probes already";
+		case NetworkProbe::PairFailure::MISMATCH:
+			return "the keys did not match";
+		case NetworkProbe::PairFailure::STORAGE:
+			return "the pairing could not be saved";
+	}
+	return "unknown";
 }
 }  // namespace
 
@@ -138,6 +164,7 @@ void Dongle::run()
 			handlePacket(packet);
 		flushHost();
 		serviceSession();
+		servicePairing();
 		serviceSweep();
 		serviceTx();
 		tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
@@ -170,6 +197,11 @@ void Dongle::runLed()
 			alertLeft--;
 			red = ledBrightness;
 		}
+		else if (pairing)
+		{
+			red = tick % 6 < 3 ? ledBrightness : 0;
+			green = red * 3 / 4;
+		}
 		else if (selected)
 			green = count != seen ? ledBrightness / 6 : ledBrightness;
 		else
@@ -190,6 +222,7 @@ void Dongle::startWifi()
 		result = nvs_flash_init();
 	}
 	ESP_ERROR_CHECK(result);
+	loadPairings();
 
 	/* A station that joins nothing: ESP-NOW only, on the channels the country allows, at every rung of the ladder */
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -216,9 +249,12 @@ void Dongle::startWifi()
 	peer.ifidx = WIFI_IF_STA;
 	ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-	uint8_t mac[6];
-	esp_read_mac(mac, ESP_MAC_WIFI_STA);
-	ESP_LOGI(tag, "ESP-NOW on channels %u to %u (country %s) as " MACSTR, firstChannel, lastChannel, CONFIG_DONGLE_COUNTRY, MAC2STR(mac));
+	esp_read_mac(ownMac, ESP_MAC_WIFI_STA);
+	ESP_LOGI(tag, "ESP-NOW on channels %u to %u (country %s) as " MACSTR, firstChannel, lastChannel, CONFIG_DONGLE_COUNTRY, MAC2STR(ownMac));
+	if (!pairedCount)
+		ESP_LOGI(tag, "paired with no probe: it talks to unpaired probes");
+	for (size_t i = 0; i < pairedCount; ++i)
+		ESP_LOGI(tag, "paired with %s, " MACSTR, paired[i].id, MAC2STR(paired[i].mac));
 }
 
 void Dongle::startUsb()
@@ -282,6 +318,14 @@ void Dongle::serviceLine()
 	{
 		ESP_LOGI(tag, "the host closed the port");
 		deselect(true);
+		/* A pairing belongs to the host that asked for it */
+		if (pairJob.active)
+		{
+			ESP_LOGW(tag, "pairing with %s cancelled", pairJob.id);
+			pairKeys.clear();
+			pairJob = {};
+			pairing = false;
+		}
 		/* Nobody reads what waits for the host any more */
 		while (hostQueueCount)
 		{
@@ -358,10 +402,10 @@ void Dongle::handleHostFrame(const NetworkProbe::FrameHeader& header, const uint
 	{
 		case NetworkProbe::Type::DISCOVER:
 		case NetworkProbe::Type::IDENTIFY:
-			/* Every probe in range hears it; the answers come back as packets. The session owns the radio */
+			/* Every probe in range hears it; the answers come back as packets. A session or a pairing owns the radio */
 			answeredCount = 0;
-			if (selected)
-				queuePacket(broadcastMac, probeChannel, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0}, frame, length);
+			if (radioOwned())
+				queueBroadcast(ownedChannel(), EspNowLink::Kind::DATA, broadcastMac, frame, length);
 			else
 				startSweep(frame, length);
 			return;
@@ -370,6 +414,15 @@ void Dongle::handleHostFrame(const NetworkProbe::FrameHeader& header, const uint
 			return;
 		case NetworkProbe::Type::DONGLE_STATUS:
 			handleStatus(header);
+			return;
+		case NetworkProbe::Type::DONGLE_PAIR:
+			handlePair(header, frame + NetworkProbe::headerSize);
+			return;
+		case NetworkProbe::Type::DONGLE_UNPAIR:
+			handleUnpair(header, frame + NetworkProbe::headerSize);
+			return;
+		case NetworkProbe::Type::DONGLE_PAIRINGS:
+			handlePairings(header);
 			return;
 		default:
 			break;
@@ -382,23 +435,49 @@ void Dongle::handleHostFrame(const NetworkProbe::FrameHeader& header, const uint
 		ESP_LOGW(tag, "no room to send a request of type 0x%02x", NetworkProbe::toByte(header.type));
 }
 
+const Dongle::Probe* Dongle::findProbe(const NetworkProbe::FrameHeader& header, const uint8_t* const payload, bool& valid) const
+{
+	valid = header.length >= 1 && header.length == 1U + payload[0];
+	if (!valid)
+		return nullptr;
+	for (const Probe& probe : probes)
+		if (probe.used && strlen(probe.id) == payload[0] && !memcmp(probe.id, payload + 1, payload[0]))
+			return &probe;
+	return nullptr;
+}
+
 void Dongle::handleSelect(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
 {
-	if (header.length < 1 || header.length != 1U + payload[0])
+	bool valid = false;
+	const Probe* const probe = findProbe(header, payload, valid);
+	if (!valid || !probe)
 	{
-		answerHost(header.seq, header.type, NetworkProbe::Status::MALFORMED);
+		answerHost(header.seq, header.type, valid ? NetworkProbe::Status::NO_PROBE : NetworkProbe::Status::MALFORMED);
 		return;
 	}
-	for (const Probe& probe : probes)
+	if (pairJob.active)
 	{
-		if (probe.used && strlen(probe.id) == payload[0] && !memcmp(probe.id, payload + 1, payload[0]))
-		{
-			select(probe);
-			answerHost(header.seq, header.type, NetworkProbe::Status::OK);
-			return;
-		}
+		answerHost(header.seq, header.type, NetworkProbe::Status::BUSY);
+		return;
 	}
-	answerHost(header.seq, header.type, NetworkProbe::Status::NO_PROBE);
+
+	/* A paired dongle talks to its paired probes only, and a paired probe to its paired dongles only */
+	const int index = findPaired(probe->mac);
+	const char* refusal = nullptr;
+	if (index >= 0 && probe->pairing != NetworkProbe::Pairing::PAIRED)
+		refusal = "it does not know this dongle any more: pair them again, or forget it";
+	else if (index < 0 && pairedCount)
+		refusal = "this dongle talks to its paired probes only: pair them first";
+	else if (index < 0 && probe->pairing != NetworkProbe::Pairing::OPEN)
+		refusal = "it takes its paired dongles only: pair them first";
+	if (refusal)
+	{
+		ESP_LOGW(tag, "%s not selected: %s", probe->id, refusal);
+		answerHost(header.seq, header.type, NetworkProbe::Status::NOT_PAIRED);
+		return;
+	}
+	const bool done = select(*probe, index >= 0 ? paired[index].key : nullptr);
+	answerHost(header.seq, header.type, done ? NetworkProbe::Status::OK : NetworkProbe::Status::NO_PROBE);
 }
 
 void Dongle::handleStatus(const NetworkProbe::FrameHeader& header)
@@ -419,7 +498,9 @@ void Dongle::handleStatus(const NetworkProbe::FrameHeader& header)
 
 void Dongle::answerHost(const uint16_t seq, const NetworkProbe::Type request, const NetworkProbe::Status status, const uint8_t* const data, const size_t dataLength)
 {
-	uint8_t frame[NetworkProbe::frameOverhead + NetworkProbe::respHeaderSize + NetworkProbe::dongleStatusResponseSize];
+	uint8_t frame[NetworkProbe::frameOverhead + NetworkProbe::respHeaderSize + maxAnswerData];
+	if (dataLength > maxAnswerData)
+		return;
 	const uint16_t payloadLength = static_cast<uint16_t>(NetworkProbe::respHeaderSize + dataLength);
 	NetworkProbe::encodeHeader(frame, NetworkProbe::Type::RESP, payloadLength, seq);
 	frame[NetworkProbe::headerSize] = NetworkProbe::toByte(request);
@@ -471,6 +552,28 @@ void Dongle::handlePacket(Packet* const packet)
 		releasePacket(packet);
 		return;
 	}
+	const uint8_t* const frame = packet->data + EspNowLink::headerSize;
+	const size_t length = packet->length - EspNowLink::headerSize;
+
+	if (linkHeader.session == EspNowLink::noSession)
+	{
+		/* Broadcasts: only those addressed to this dongle, not the requests of other dongles to every probe */
+		if (!memcmp(linkHeader.auth, ownMac, sizeof(ownMac)))
+		{
+			if (linkHeader.kind == EspNowLink::Kind::PAIR)
+				handlePairPacket(packet->mac, frame, length);
+			else if (linkHeader.kind == EspNowLink::Kind::DATA)
+			{
+				/* A probe close by also answers the broadcasts on the channels next to its own: it says where it is */
+				rememberProbe(packet->mac, linkHeader.channel ? linkHeader.channel : packet->channel, frame, length);
+				if (firstAnswer(packet->mac) && !writeHost(frame, length))
+					hostDrops++;
+			}
+		}
+		releasePacket(packet);
+		return;
+	}
+
 	const bool fromProbe = selected && !memcmp(packet->mac, probeMac, sizeof(probeMac));
 	const bool fromSession = fromProbe && linkHeader.session == session;
 	if (fromProbe)
@@ -480,40 +583,39 @@ void Dongle::handlePacket(Packet* const packet)
 		if (txState == TxState::quiet)
 			quietUntilUs = 0;
 	}
+	if (!fromSession)
+	{
+		releasePacket(packet);
+		return;
+	}
 
-	if (linkHeader.kind == EspNowLink::Kind::CLOSE && fromSession)
+	/* With a pairing, a packet without the session's tag is someone else's, sent as the probe */
+	EspNowLink::SessionAuth::Verdict verdict = EspNowLink::SessionAuth::Verdict::drop;
+	if (linkHeader.kind == EspNowLink::Kind::DATA)
+		verdict = auth.checkData(linkHeader);
+	else if (auth.checkControl(linkHeader))
+		verdict = EspNowLink::SessionAuth::Verdict::take;
+	if (verdict == EspNowLink::SessionAuth::Verdict::drop && !dropReported)
+	{
+		ESP_LOGW(tag, "dropped a packet of session %u: its tag or sequence number is wrong, someone else may be sending as the probe", session);
+		dropReported = true;
+	}
+
+	if (linkHeader.kind == EspNowLink::Kind::CLOSE && verdict == EspNowLink::SessionAuth::Verdict::take)
 	{
 		/* Another client took over, or the probe heard nothing for too long: requests get NO_PROBE from now on */
 		ESP_LOGW(tag, "the probe ended session %u", session);
 		deselect(false);
 		alert = true;
 	}
-	if (linkHeader.kind != EspNowLink::Kind::DATA)
-	{
-		releasePacket(packet);
-		return;
-	}
-
-	const uint8_t* const frame = packet->data + EspNowLink::headerSize;
-	const size_t length = packet->length - EspNowLink::headerSize;
-	if (linkHeader.session == EspNowLink::noSession)
-	{
-		/* A probe close by also answers the broadcasts on the channels next to its own: it says where it is */
-		rememberProbe(packet->mac, linkHeader.channel ? linkHeader.channel : packet->channel, frame, length);
-		if (firstAnswer(packet->mac) && !writeHost(frame, length))
-			hostDrops++;
-		releasePacket(packet);
-		return;
-	}
-	/* Another session's, or a resend whose first copy came through */
-	if (!fromSession || linkHeader.seq == rxSeq)
+	/* Not DATA, a resend whose first copy came through, or not the probe's */
+	if (linkHeader.kind != EspNowLink::Kind::DATA || verdict != EspNowLink::SessionAuth::Verdict::take)
 	{
 		releasePacket(packet);
 		return;
 	}
 
 	/* In order behind those that wait; it holds its pool place until the USB buffer takes it */
-	rxSeq = linkHeader.seq;
 	hostQueue[(hostQueueHead + hostQueueCount) % poolSize] = packet;
 	hostQueueCount++;
 	flushHost();
@@ -571,10 +673,11 @@ void Dongle::rememberProbe(const uint8_t* const mac, const uint8_t channel, cons
 	strlcpy(slot->id, id, sizeof(slot->id));
 	memcpy(slot->mac, mac, sizeof(slot->mac));
 	slot->channel = channel;
+	slot->pairing = static_cast<NetworkProbe::Pairing>(payload[NetworkProbe::respHeaderSize + 5]);
 	slot->used = true;
 }
 
-void Dongle::select(const Probe& probe)
+bool Dongle::select(const Probe& probe, const uint8_t* const key)
 {
 	/* The CLOSE to the probe before goes on its channel, the sweep's broadcasts queued already on theirs */
 	deselect(true);
@@ -583,18 +686,24 @@ void Dongle::select(const Probe& probe)
 	probeChannel = probe.channel;
 	probeRssi = 0;
 
-	esp_now_peer_info_t peer = {};
-	memcpy(peer.peer_addr, probeMac, sizeof(peer.peer_addr));
-	peer.ifidx = WIFI_IF_STA;
-	esp_err_t result = esp_now_is_peer_exist(probeMac) ? ESP_OK : esp_now_add_peer(&peer);
-	if (result == ESP_ERR_ESPNOW_FULL)
+	do
+		session = static_cast<uint16_t>(esp_random());
+	while (session == EspNowLink::noSession);
+	if (key)
+		auth.startPaired(key, session, EspNowLink::Direction::toProbe);
+	else
+		auth.startOpen();
+	if (key && !auth.isPaired())
 	{
-		/* Probes selected before: every unicast peer goes, the broadcast one stays */
-		esp_now_peer_info_t old = {};
-		while (esp_now_fetch_peer(true, &old) == ESP_OK)
-			esp_now_del_peer(old.peer_addr);
-		result = esp_now_add_peer(&peer);
+		ESP_LOGE(tag, "the session tags cannot be computed: %s not selected", probe.id);
+		return false;
 	}
+
+	/* A paired probe's packets are encrypted by the radio */
+	uint8_t lmk[EspNowLink::lmkSize];
+	const bool encrypt = key && EspNowLink::deriveLmk(key, lmk);
+	esp_err_t result = setPeer(probeMac, encrypt ? lmk : nullptr);
+	memset(lmk, 0, sizeof(lmk));
 	/* Without it ESP-NOW sends at 1 Mb/s */
 	ladder.reset();
 	if (result == ESP_OK)
@@ -602,18 +711,40 @@ void Dongle::select(const Probe& probe)
 	if (result != ESP_OK)
 		ESP_LOGW(tag, "peer " MACSTR ": %s", MAC2STR(probeMac), esp_err_to_name(result));
 
-	do
-		session = static_cast<uint16_t>(esp_random());
-	while (session == EspNowLink::noSession);
-	txSeq = 1;
+	txNumber = 1;
 	lastDataSeq = 0;
-	rxSeq = 0;
 	advertisedLimit = 0;
 	quietReported = false;
+	dropReported = false;
 	lastSendUs = esp_timer_get_time();
 	lastAckUs = lastSendUs;
 	selected = true;
-	ESP_LOGI(tag, "session %u with %s, " MACSTR " on channel %u", session, probe.id, MAC2STR(probeMac), probeChannel);
+	ESP_LOGI(tag, "session %u with %s, " MACSTR " on channel %u (%s)", session, probe.id, MAC2STR(probeMac), probeChannel, key ? "paired, encrypted" : "unpaired");
+	return true;
+}
+
+esp_err_t Dongle::setPeer(const uint8_t* const mac, const uint8_t* const lmk)
+{
+	esp_now_peer_info_t peer = {};
+	memcpy(peer.peer_addr, mac, sizeof(peer.peer_addr));
+	peer.ifidx = WIFI_IF_STA;
+	peer.encrypt = lmk != nullptr;
+	if (lmk)
+		memcpy(peer.lmk, lmk, sizeof(peer.lmk));
+	/* As new: it may have been added with another key, or none */
+	if (esp_now_is_peer_exist(mac))
+		esp_now_del_peer(mac);
+	esp_err_t result = esp_now_add_peer(&peer);
+	if (result != ESP_OK)
+	{
+		/* Full, or out of encrypted peers: the probes selected before go, the broadcast peer stays */
+		esp_now_peer_info_t old = {};
+		while (esp_now_fetch_peer(true, &old) == ESP_OK)
+			esp_now_del_peer(old.peer_addr);
+		result = esp_now_add_peer(&peer);
+	}
+	memset(peer.lmk, 0, sizeof(peer.lmk));
+	return result;
 }
 
 void Dongle::deselect(const bool tellProbe)
@@ -630,7 +761,7 @@ void Dongle::deselect(const bool tellProbe)
 uint16_t Dongle::limit() const
 {
 	const UBaseType_t free = uxQueueMessagesWaiting(freeQueue);
-	return static_cast<uint16_t>(rxSeq + (free > poolReserve ? free - poolReserve : 0));
+	return static_cast<uint16_t>(auth.lastTaken() + (free > poolReserve ? free - poolReserve : 0));
 }
 
 bool Dongle::sendToProbe(const EspNowLink::Kind kind, const uint8_t* const frame, const size_t length)
@@ -638,18 +769,19 @@ bool Dongle::sendToProbe(const EspNowLink::Kind kind, const uint8_t* const frame
 	/* A PING tells the last DATA, so a probe that does not know the session tells it from one not started yet */
 	uint16_t seq = 0;
 	if (kind == EspNowLink::Kind::DATA)
-		seq = txSeq;
+		seq = static_cast<uint16_t>(txNumber);
 	else if (kind == EspNowLink::Kind::PING)
 		seq = lastDataSeq;
-	const EspNowLink::Header header = {kind, session, seq, limit(), 0};
+	EspNowLink::Header header = {kind, session, seq, limit(), 0, {}};
+	auth.stamp(header, txNumber);
 	if (!queuePacket(probeMac, probeChannel, header, frame, length, kind == EspNowLink::Kind::CLOSE))
 		return false;
 	if (kind == EspNowLink::Kind::DATA)
 	{
-		lastDataSeq = txSeq;
-		txSeq = static_cast<uint16_t>(txSeq + 1);
-		if (txSeq == 0)
-			txSeq = 1;
+		lastDataSeq = seq;
+		/* seq 0 is a PING's before the first DATA */
+		if (static_cast<uint16_t>(++txNumber) == 0)
+			txNumber++;
 	}
 	advertisedLimit = header.limit;
 	lastSendUs = esp_timer_get_time();
@@ -672,6 +804,13 @@ bool Dongle::queuePacket(const uint8_t* const mac, const uint8_t channel, EspNow
 	txCount++;
 	serviceTx();
 	return true;
+}
+
+bool Dongle::queueBroadcast(const uint8_t channel, const EspNowLink::Kind kind, const uint8_t* const to, const uint8_t* const data, const size_t length)
+{
+	EspNowLink::Header header = {kind, EspNowLink::noSession, 0, 0, 0, {}};
+	EspNowLink::addressTo(header, to);
+	return queuePacket(broadcastMac, channel, header, data, length);
 }
 
 void Dongle::serviceTx()
@@ -831,7 +970,7 @@ void Dongle::serviceSweep()
 		sweepChannel++;
 	}
 	/* A full queue skips a copy */
-	queuePacket(broadcastMac, sweepChannel, {EspNowLink::Kind::DATA, EspNowLink::noSession, 0, 0, 0}, sweepFrame, sweepLength);
+	queueBroadcast(sweepChannel, EspNowLink::Kind::DATA, broadcastMac, sweepFrame, sweepLength);
 	sweepCopy++;
 	sweepNextUs = now + sweepDwellMs * 1000LL / sweepCopies;
 }
@@ -852,7 +991,326 @@ void Dongle::serviceSession()
 	/* A raised limit goes out early, before the probe runs out of it; a PING keeps the session alive */
 	const uint16_t fresh = limit();
 	const bool raised = static_cast<int16_t>(static_cast<uint16_t>(fresh - advertisedLimit)) >= static_cast<int16_t>(creditStep);
-	const bool starving = fresh != advertisedLimit && !EspNowLink::allows(advertisedLimit, static_cast<uint16_t>(rxSeq + 1));
+	const bool starving = fresh != advertisedLimit && !EspNowLink::allows(advertisedLimit, static_cast<uint16_t>(auth.lastTaken() + 1));
 	if (raised || starving || now - lastSendUs >= EspNowLink::pingIntervalMs * 1000LL)
 		sendToProbe(EspNowLink::Kind::PING, nullptr, 0);
+}
+
+void Dongle::handlePair(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
+{
+	bool valid = false;
+	const Probe* const probe = findProbe(header, payload, valid);
+	if (!valid || !probe)
+	{
+		answerHost(header.seq, header.type, valid ? NetworkProbe::Status::NO_PROBE : NetworkProbe::Status::MALFORMED);
+		return;
+	}
+	if (pairJob.active)
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::BUSY);
+		return;
+	}
+	NetworkProbe::PairFailure failure = {};
+	if (pairedCount == maxPaired && findPaired(probe->mac) < 0)
+		failure = NetworkProbe::PairFailure::DONGLE_FULL;
+	else if (!pairKeys.generate())
+		failure = NetworkProbe::PairFailure::MISMATCH;
+	if (failure != NetworkProbe::PairFailure{})
+	{
+		ESP_LOGW(tag, "pairing with %s failed: %s", probe->id, failureName(failure));
+		const uint8_t reason = NetworkProbe::toByte(failure);
+		answerHost(header.seq, header.type, NetworkProbe::Status::PAIRING_FAILED, &reason, sizeof(reason));
+		return;
+	}
+
+	/* The session ends, and the radio stays on the probe's channel for the pairing */
+	deselect(true);
+	sweepChannel = 0;
+	const int64_t now = esp_timer_get_time();
+	pairJob = {};
+	pairJob.active = true;
+	memcpy(pairJob.mac, probe->mac, sizeof(pairJob.mac));
+	pairJob.channel = probe->channel;
+	strlcpy(pairJob.id, probe->id, sizeof(pairJob.id));
+	pairJob.hostSeq = header.seq;
+	pairJob.deadlineUs = now + EspNowLink::pairTimeoutMs * 1000LL;
+	pairJob.nextSendUs = now;
+	pairing = true;
+	ESP_LOGI(tag, "pairing with %s, " MACSTR " on channel %u%s: press its BOOT button briefly once its LED blinks yellow", probe->id, MAC2STR(probe->mac), probe->channel,
+			 findPaired(probe->mac) >= 0 ? " again" : "");
+	servicePairing();
+}
+
+void Dongle::handleUnpair(const NetworkProbe::FrameHeader& header, const uint8_t* const payload)
+{
+	if (header.length < 1 || header.length != 1U + payload[0])
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::MALFORMED);
+		return;
+	}
+	const int index = findPairedById(reinterpret_cast<const char*>(payload + 1), payload[0]);
+	if (index < 0)
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::NO_PROBE);
+		return;
+	}
+	if (pairJob.active && !memcmp(pairJob.mac, paired[index].mac, sizeof(pairJob.mac)))
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::BUSY);
+		return;
+	}
+
+	const PairedProbe gone = paired[index];
+	if (selected && !memcmp(probeMac, gone.mac, sizeof(probeMac)))
+		deselect(true);
+	for (size_t i = static_cast<size_t>(index); i + 1 < pairedCount; ++i)
+		paired[i] = paired[i + 1];
+	pairedCount--;
+	paired[pairedCount] = {};
+	if (!savePairings())
+	{
+		ESP_LOGE(tag, "saving failed: %s is still paired", gone.id);
+		loadPairings();
+		const uint8_t reason = NetworkProbe::toByte(NetworkProbe::PairFailure::STORAGE);
+		answerHost(header.seq, header.type, NetworkProbe::Status::PAIRING_FAILED, &reason, sizeof(reason));
+		return;
+	}
+	/* The key leaves the radio too; a CLOSE queued for the probe goes without it */
+	if (esp_now_is_peer_exist(gone.mac) && setPeer(gone.mac, nullptr) == ESP_OK)
+		EspNowLink::setPeerRate(gone.mac, ladder.getRung());
+	if (pairedCount)
+		ESP_LOGW(tag, "forgot %s, " MACSTR "; %u probe(s) still paired", gone.id, MAC2STR(gone.mac), static_cast<unsigned>(pairedCount));
+	else
+		ESP_LOGW(tag, "forgot %s, " MACSTR ": paired with no probe any more, it talks to unpaired probes", gone.id, MAC2STR(gone.mac));
+	answerHost(header.seq, header.type, NetworkProbe::Status::OK);
+}
+
+void Dongle::handlePairings(const NetworkProbe::FrameHeader& header)
+{
+	if (header.length != 0)
+	{
+		answerHost(header.seq, header.type, NetworkProbe::Status::MALFORMED);
+		return;
+	}
+	uint8_t data[maxAnswerData];
+	size_t length = 0;
+	data[length++] = static_cast<uint8_t>(pairedCount);
+	for (size_t i = 0; i < pairedCount; ++i)
+	{
+		memcpy(data + length, paired[i].mac, sizeof(paired[i].mac));
+		length += sizeof(paired[i].mac);
+		const size_t idLength = strlen(paired[i].id);
+		data[length++] = static_cast<uint8_t>(idLength);
+		memcpy(data + length, paired[i].id, idLength);
+		length += idLength;
+	}
+	answerHost(header.seq, header.type, NetworkProbe::Status::OK, data, length);
+}
+
+void Dongle::loadPairings()
+{
+	pairedCount = 0;
+	nvs_handle_t handle;
+	if (nvs_open(pairingNamespace, NVS_READONLY, &handle) != ESP_OK)
+		return;
+	constexpr size_t entrySize = sizeof(PairedProbe::mac) + sizeof(PairedProbe::id) + sizeof(PairedProbe::key);
+	uint8_t blob[2 + maxPaired * entrySize];
+	size_t length = sizeof(blob);
+	const esp_err_t result = nvs_get_blob(handle, pairingKey, blob, &length);
+	nvs_close(handle);
+	if (result == ESP_ERR_NVS_NOT_FOUND)
+		return;
+	if (result != ESP_OK || length < 2 || blob[0] != pairingFormat || blob[1] > maxPaired || length != 2 + blob[1] * entrySize)
+	{
+		ESP_LOGE(tag, "the saved pairings cannot be read (%s, %u bytes): the dongle starts unpaired", esp_err_to_name(result), static_cast<unsigned>(length));
+		return;
+	}
+	pairedCount = blob[1];
+	for (size_t i = 0; i < pairedCount; ++i)
+	{
+		const uint8_t* const entry = blob + 2 + i * entrySize;
+		memcpy(paired[i].mac, entry, sizeof(paired[i].mac));
+		memcpy(paired[i].id, entry + sizeof(paired[i].mac), sizeof(paired[i].id));
+		paired[i].id[sizeof(paired[i].id) - 1] = '\0';
+		memcpy(paired[i].key, entry + sizeof(paired[i].mac) + sizeof(paired[i].id), sizeof(paired[i].key));
+	}
+	memset(blob, 0, sizeof(blob));
+}
+
+bool Dongle::savePairings() const
+{
+	constexpr size_t entrySize = sizeof(PairedProbe::mac) + sizeof(PairedProbe::id) + sizeof(PairedProbe::key);
+	uint8_t blob[2 + maxPaired * entrySize] = {};
+	blob[0] = pairingFormat;
+	blob[1] = static_cast<uint8_t>(pairedCount);
+	for (size_t i = 0; i < pairedCount; ++i)
+	{
+		uint8_t* const entry = blob + 2 + i * entrySize;
+		memcpy(entry, paired[i].mac, sizeof(paired[i].mac));
+		memcpy(entry + sizeof(paired[i].mac), paired[i].id, sizeof(paired[i].id));
+		memcpy(entry + sizeof(paired[i].mac) + sizeof(paired[i].id), paired[i].key, sizeof(paired[i].key));
+	}
+	nvs_handle_t handle;
+	bool written = nvs_open(pairingNamespace, NVS_READWRITE, &handle) == ESP_OK;
+	if (written)
+	{
+		written = nvs_set_blob(handle, pairingKey, blob, 2 + pairedCount * entrySize) == ESP_OK && nvs_commit(handle) == ESP_OK;
+		nvs_close(handle);
+	}
+	memset(blob, 0, sizeof(blob));
+	return written;
+}
+
+int Dongle::findPaired(const uint8_t* const mac) const
+{
+	for (size_t i = 0; i < pairedCount; ++i)
+		if (!memcmp(paired[i].mac, mac, sizeof(paired[i].mac)))
+			return static_cast<int>(i);
+	return -1;
+}
+
+int Dongle::findPairedById(const char* const id, const size_t length) const
+{
+	for (size_t i = 0; i < pairedCount; ++i)
+		if (strlen(paired[i].id) == length && !memcmp(paired[i].id, id, length))
+			return static_cast<int>(i);
+	return -1;
+}
+
+bool Dongle::storePairing(const uint8_t* const mac, const char* const id, const uint8_t* const key)
+{
+	int index = findPaired(mac);
+	if (index < 0)
+	{
+		if (pairedCount == maxPaired)
+			return false;
+		index = static_cast<int>(pairedCount++);
+	}
+	memcpy(paired[index].mac, mac, sizeof(paired[index].mac));
+	strlcpy(paired[index].id, id, sizeof(paired[index].id));
+	memcpy(paired[index].key, key, sizeof(paired[index].key));
+	if (savePairings())
+		return true;
+	loadPairings();
+	return false;
+}
+
+void Dongle::handlePairPacket(const uint8_t* const mac, const uint8_t* const data, const size_t length)
+{
+	if (!pairJob.active || memcmp(mac, pairJob.mac, sizeof(pairJob.mac)) || length < 1)
+		return;
+	const int64_t now = esp_timer_get_time();
+	switch (static_cast<EspNowLink::PairStep>(data[0]))
+	{
+		case EspNowLink::PairStep::WAIT:
+			if (length == EspNowLink::pairSignalSize && !pairJob.heard)
+			{
+				pairJob.heard = true;
+				ESP_LOGI(tag, "%s waits for its BOOT button: press it briefly", pairJob.id);
+			}
+			return;
+		case EspNowLink::PairStep::ACCEPT:
+		{
+			if (length != EspNowLink::pairAcceptSize || pairJob.accepted)
+				return;
+			uint8_t expected[EspNowLink::confirmSize];
+			const bool agreed = pairKeys.agree(data + 1, true, ownMac, pairJob.mac, pairJob.key) && EspNowLink::deriveConfirm(pairJob.key, EspNowLink::Direction::toDongle, expected) &&
+								EspNowLink::sameBytes(data + 1 + EspNowLink::publicKeySize, expected, sizeof(expected)) &&
+								EspNowLink::deriveConfirm(pairJob.key, EspNowLink::Direction::toProbe, pairJob.confirm);
+			if (!agreed)
+			{
+				ESP_LOGW(tag, "pairing with %s failed: %s", pairJob.id, failureName(NetworkProbe::PairFailure::MISMATCH));
+				endPairing(NetworkProbe::Status::PAIRING_FAILED, NetworkProbe::PairFailure::MISMATCH);
+				return;
+			}
+			pairKeys.clear();
+			pairJob.accepted = true;
+			pairJob.deadlineUs = now + EspNowLink::pairDoneTimeoutMs * 1000LL;
+			pairJob.nextSendUs = now;
+			ESP_LOGI(tag, "%s accepted the pairing: confirming the key", pairJob.id);
+			servicePairing();
+			return;
+		}
+		case EspNowLink::PairStep::PAIRED:
+			if (length != EspNowLink::pairSignalSize || !pairJob.accepted)
+				return;
+			if (!storePairing(pairJob.mac, pairJob.id, pairJob.key))
+			{
+				ESP_LOGE(tag, "saving the pairing with %s failed: the probe keeps a pairing this dongle lost, pair them again", pairJob.id);
+				endPairing(NetworkProbe::Status::PAIRING_FAILED, NetworkProbe::PairFailure::STORAGE);
+				return;
+			}
+			ESP_LOGW(tag, "paired with %s (%u of %u): this dongle talks to its paired probes only", pairJob.id, static_cast<unsigned>(pairedCount), static_cast<unsigned>(maxPaired));
+			/* As its next DISCOVER answer will say: DONGLE_SELECT may follow at once */
+			for (Probe& probe : probes)
+				if (probe.used && !memcmp(probe.mac, pairJob.mac, sizeof(probe.mac)))
+					probe.pairing = NetworkProbe::Pairing::PAIRED;
+			endPairing(NetworkProbe::Status::OK);
+			return;
+		case EspNowLink::PairStep::REFUSE:
+		{
+			if (length != EspNowLink::pairRefuseSize)
+				return;
+			const NetworkProbe::PairFailure reason = static_cast<NetworkProbe::PairFailure>(data[1]);
+			ESP_LOGW(tag, "%s refused the pairing: %s", pairJob.id, failureName(reason));
+			endPairing(NetworkProbe::Status::PAIRING_FAILED, reason);
+			return;
+		}
+		default:
+			return;
+	}
+}
+
+void Dongle::sendPairStep(const uint8_t* const data, const size_t length)
+{
+	/* Broadcast, addressed to the probe: neither side has a key for the other yet */
+	queueBroadcast(pairJob.channel, EspNowLink::Kind::PAIR, pairJob.mac, data, length);
+}
+
+void Dongle::servicePairing()
+{
+	if (!pairJob.active)
+		return;
+	const int64_t now = esp_timer_get_time();
+	if (now >= pairJob.deadlineUs)
+	{
+		if (pairJob.accepted)
+		{
+			ESP_LOGW(tag, "pairing with %s failed: it did not confirm, it may have saved the pairing; pair them again", pairJob.id);
+			endPairing(NetworkProbe::Status::PAIRING_FAILED, NetworkProbe::PairFailure::NO_ANSWER);
+			return;
+		}
+		const NetworkProbe::PairFailure reason = pairJob.heard ? NetworkProbe::PairFailure::NO_PRESS : NetworkProbe::PairFailure::NO_ANSWER;
+		ESP_LOGW(tag, "pairing with %s failed: %s", pairJob.id, failureName(reason));
+		endPairing(NetworkProbe::Status::PAIRING_FAILED, reason);
+		return;
+	}
+	if (now < pairJob.nextSendUs)
+		return;
+	if (!pairJob.accepted)
+	{
+		uint8_t data[EspNowLink::pairRequestSize];
+		data[0] = NetworkProbe::toByte(EspNowLink::PairStep::REQUEST);
+		memcpy(data + 1, pairKeys.getPublic(), EspNowLink::publicKeySize);
+		sendPairStep(data, sizeof(data));
+		pairJob.nextSendUs = now + EspNowLink::pairRequestIntervalMs * 1000LL;
+	}
+	else
+	{
+		uint8_t data[EspNowLink::pairDoneSize];
+		data[0] = NetworkProbe::toByte(EspNowLink::PairStep::DONE);
+		memcpy(data + 1, pairJob.confirm, EspNowLink::confirmSize);
+		sendPairStep(data, sizeof(data));
+		pairJob.nextSendUs = now + EspNowLink::pairDoneIntervalMs * 1000LL;
+	}
+}
+
+void Dongle::endPairing(const NetworkProbe::Status status, const NetworkProbe::PairFailure reason)
+{
+	const uint8_t data = NetworkProbe::toByte(reason);
+	const bool failed = status == NetworkProbe::Status::PAIRING_FAILED;
+	answerHost(pairJob.hostSeq, NetworkProbe::Type::DONGLE_PAIR, status, failed ? &data : nullptr, failed ? 1 : 0);
+	pairKeys.clear();
+	pairJob = {};
+	pairing = false;
 }

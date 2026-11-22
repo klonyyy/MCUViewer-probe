@@ -12,6 +12,7 @@
 #include <atomic>
 
 #include "EspNowLink.hpp"
+#include "EspNowPairing.hpp"
 #include "EspNowRate.hpp"
 #include "NetworkProbeProto.hpp"
 #include "esp_now.h"
@@ -40,8 +41,14 @@
  * takes them, and the limit the dongle gives the probe counts the free part of the pool, so a host that reads slowly
  * holds the probe back instead of losing frames. The packets to the probe move a rate ladder (EspNowRate.hpp).
  *
- * One task does the work, woken by the USB and ESP-NOW callbacks; the status LED blinks blue without a session and
- * shows green with one, dipping for the traffic.
+ * Pairing (EspNowPairing.hpp): DONGLE_PAIR runs the dongle's side of it, and the pairings are kept in NVS. A dongle
+ * paired with any probe selects its paired probes only, and their sessions are encrypted: the probe is an encrypted
+ * peer from DONGLE_SELECT on, and every packet of the session carries the session's tag, which the dongle checks on
+ * the probe's packets too. Packets with session 0 are broadcasts both ways, addressed in their header; the dongle takes
+ * only those addressed to it.
+ *
+ * One task does the work, woken by the USB and ESP-NOW callbacks; the status LED blinks blue without a session, shows
+ * green with one, dipping for the traffic, and blinks yellow while it pairs.
  */
 class Dongle
 {
@@ -64,7 +71,32 @@ class Dongle
 		char id[32];
 		uint8_t mac[6];
 		uint8_t channel;
+		NetworkProbe::Pairing pairing; /**< As its last answer told. */
 		bool used;
+	};
+
+	/** A probe paired with the dongle, kept in NVS. */
+	struct PairedProbe
+	{
+		uint8_t mac[6];
+		char id[32];
+		uint8_t key[EspNowLink::keySize];
+	};
+
+	/** The dongle's side of a pairing, for a DONGLE_PAIR. */
+	struct PairJob
+	{
+		bool active;
+		bool heard;	   /**< The probe answered WAIT: it waits for its button. */
+		bool accepted; /**< ACCEPT came and checked out: DONE goes out until PAIRED. */
+		uint8_t mac[6];
+		uint8_t channel;
+		char id[32];
+		uint16_t hostSeq; /**< Of the DONGLE_PAIR, which is answered at the end. */
+		int64_t deadlineUs;
+		int64_t nextSendUs;
+		uint8_t key[EspNowLink::keySize];
+		uint8_t confirm[EspNowLink::confirmSize]; /**< The dongle's, for DONE. */
 	};
 
 	enum class TxState : uint8_t
@@ -81,9 +113,12 @@ class Dongle
 	static constexpr size_t txQueueSize = 8;
 	static constexpr uint16_t creditStep = 8; /**< The limit goes out in a PING of its own once it rose this much. */
 	static constexpr size_t maxProbes = 16;
+	static constexpr size_t maxPaired = NetworkProbe::maxPairedProbes;
+	/** The longest answer of the dongle's own: DONGLE_PAIRINGS. */
+	static constexpr size_t maxAnswerData = 1 + maxPaired * (NetworkProbe::macSize + 1 + sizeof(PairedProbe::id) - 1);
 	static constexpr uint32_t sweepDwellMs = 40; /**< A probe answers within a few ms, so 11 channels take under 0.5 s. */
 	static constexpr uint8_t sweepCopies = 2;	 /**< Broadcasts per channel: they get no acknowledgement. */
-	static constexpr uint32_t taskStackSize = 6144;
+	static constexpr uint32_t taskStackSize = 8192; /**< X25519 of a pairing runs in it. */
 	static constexpr uint32_t taskPriority = 5;
 	static constexpr int taskCore = 1; /**< With TinyUSB; Wi-Fi has core 0. */
 	static constexpr uint32_t pollMs = 50;
@@ -109,6 +144,15 @@ class Dongle
 	void handleHostFrame(const NetworkProbe::FrameHeader& header, const uint8_t* frame, size_t length);
 	void handleSelect(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
 	void handleStatus(const NetworkProbe::FrameHeader& header);
+	void handlePair(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
+	void handleUnpair(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
+	void handlePairings(const NetworkProbe::FrameHeader& header);
+
+	/**
+	 * @return The probe the id of a host frame's payload names (u8 length, then the id), or nullptr.
+	 * @param valid Set when the payload is well-formed.
+	 */
+	const Probe* findProbe(const NetworkProbe::FrameHeader& header, const uint8_t* payload, bool& valid) const;
 	void answerHost(uint16_t seq, NetworkProbe::Type request, NetworkProbe::Status status, const uint8_t* data = nullptr, size_t dataLength = 0);
 
 	/**
@@ -130,9 +174,44 @@ class Dongle
 	 */
 	bool firstAnswer(const uint8_t* mac);
 	void rememberProbe(const uint8_t* mac, uint8_t channel, const uint8_t* frame, size_t length);
-	void select(const Probe& probe);
+
+	/**
+	 * @param key The pair key of the probe, or nullptr for an unpaired session.
+	 * @return False when the session could not start.
+	 */
+	bool select(const Probe& probe, const uint8_t* key);
 	void deselect(bool tellProbe);
 	void releasePacket(Packet* packet);
+
+	/**
+	 * @brief Makes mac a unicast peer, encrypted with lmk unless it is nullptr; probes selected before make room.
+	 */
+	esp_err_t setPeer(const uint8_t* mac, const uint8_t* lmk);
+
+	/* Pairing */
+	void loadPairings();
+	bool savePairings() const;
+	int findPaired(const uint8_t* mac) const;
+	int findPairedById(const char* id, size_t length) const;
+	bool storePairing(const uint8_t* mac, const char* id, const uint8_t* key);
+	void handlePairPacket(const uint8_t* mac, const uint8_t* data, size_t length);
+	void sendPairStep(const uint8_t* data, size_t length);
+
+	/**
+	 * @brief Sends REQUEST or DONE when due, and gives up when the time is over.
+	 */
+	void servicePairing();
+
+	/**
+	 * @brief Answers the DONGLE_PAIR and ends the job.
+	 */
+	void endPairing(NetworkProbe::Status status, NetworkProbe::PairFailure reason = {});
+
+	/**
+	 * @return Whether the radio stays on one channel: a session, or a pairing; that channel then.
+	 */
+	bool radioOwned() const { return selected || pairJob.active; }
+	uint8_t ownedChannel() const { return selected ? probeChannel : pairJob.channel; }
 
 	/**
 	 * @return The highest seq the probe may send: the last one taken, and the pool free for more.
@@ -149,6 +228,11 @@ class Dongle
 	 * @param once No resends: for a CLOSE.
 	 */
 	bool queuePacket(const uint8_t* mac, uint8_t channel, EspNowLink::Header header, const uint8_t* frame, size_t length, bool once = false);
+
+	/**
+	 * @brief Queues a broadcast with session 0, addressed to mac: every probe with EspNowLink::broadcastMac.
+	 */
+	bool queueBroadcast(uint8_t channel, EspNowLink::Kind kind, const uint8_t* to, const uint8_t* data, size_t length);
 
 	/**
 	 * @brief Sends the next queued packet once the one before is through, or sends that one again, after a quiet
@@ -244,22 +328,30 @@ class Dongle
 	uint8_t answered[maxProbes][6] = {}; /**< The probes that answered the host's last DISCOVER or IDENTIFY. */
 	size_t answeredCount = 0;
 
+	uint8_t ownMac[6] = {};
+	PairedProbe paired[maxPaired] = {};
+	size_t pairedCount = 0;
+	PairJob pairJob = {};
+	EspNowLink::KeyPair pairKeys; /**< The dongle's, from DONGLE_PAIR until ACCEPT. */
+
 	std::atomic<bool> selected{false};
 	uint8_t probeMac[6] = {};
 	uint8_t probeChannel = 0;
 	EspNowLink::RateLadder ladder; /**< Of the packets to the probe. */
 	int8_t probeRssi = 0;		   /**< Of the last packet from the probe, for DONGLE_STATUS. */
 	uint16_t session = EspNowLink::noSession;
-	uint16_t txSeq = 1;			  /**< seq of the next DATA to the probe. */
+	EspNowLink::SessionAuth auth; /**< Tags, and the seq of the last DATA taken from the probe. */
+	uint32_t txNumber = 1;		  /**< Of the next DATA to the probe: its seq is the lower half, never 0. */
 	uint16_t lastDataSeq = 0;	  /**< seq of the last DATA to the probe, 0 before the first: PING carries it. */
-	uint16_t rxSeq = 0;			  /**< seq of the last DATA taken from the probe. */
 	uint16_t advertisedLimit = 0; /**< The limit the probe got last. */
+	bool dropReported = false;	  /**< A packet of the session with a wrong tag or seq was logged. */
 	int64_t lastSendUs = 0;
 	std::atomic<int64_t> lastAckUs{0}; /**< The probe's radio acknowledged a packet. */
 
 	led_strip_handle_t led = nullptr;
 	std::atomic<uint32_t> traffic{0};
-	std::atomic<bool> alert{false}; /**< The session ended from the probe's side: one red flash. */
+	std::atomic<bool> alert{false};	  /**< The session ended from the probe's side: one red flash. */
+	std::atomic<bool> pairing{false}; /**< For the LED. */
 };
 
 #endif /* DONGLE_HPP */

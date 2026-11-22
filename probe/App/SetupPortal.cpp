@@ -92,7 +92,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em}
 <div class="check"><input type="checkbox" id="field"><label for="field">Field mode: no Wi-Fi network, ESP-NOW only</label></div>
 <label for="chan">Field mode channel</label>
 <select id="chan"></select>
-<p class="hint">In field mode the probe joins no network and keeps its radio on this channel, so a dongle finds it at any time. With several probes in field mode, give each its own channel: 1, 6 or 11. To leave field mode, hold the BOOT button for 3 seconds; the saved networks stay.</p>
+<p class="hint">In field mode the probe joins no network and keeps its radio on this channel, so a dongle finds it at any time. With several probes in field mode, give each its own channel: 1, 6 or 11. To leave field mode, hold the BOOT button for 3 seconds and let go; the saved networks stay.</p>
 <button id="save" type="button">Save</button>
 <p id="saved"></p>
 </div>

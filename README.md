@@ -51,12 +51,17 @@ order.
 | orange | GDB session; it dips briefly for the packets |
 | one amber flash | samples or SWO bytes were dropped (buffer overflow) |
 | one red flash | an access to the target failed, or no target answered |
-| four red blinks | the target was lost, or a join from the setup page failed |
-| white, speeding up | the BOOT button is held: on release before the end nothing happens |
+| four red blinks | the target was lost, a join from the setup page failed, or a pairing failed |
+| yellow blinks | a dongle asks for [pairing](dongle/README.md#pairing): press BOOT briefly to accept |
+| three green flashes | a dongle got paired |
+| white, speeding up | the BOOT button is held: let go now and nothing happens |
+| white, steady | held for 3 s: let go now to forget the networks (in field mode: to leave it) |
+| red, fast blinks | held for 10 s: let go now, then press briefly, to forget the paired dongles |
+| red and white by turns | waiting 5 s for the short press that forgets the paired dongles |
 | white, fast blinks for 2 s | MCUViewer asked which probe this is (the bulb button next to the probe list) |
 
-Alerts show over the session and the network, identification over alerts, and the held button
-over everything.
+Alerts show over the session and the network, identification over alerts, pairing over
+identification, and the held button over everything.
 
 ## Building the firmware
 
@@ -108,11 +113,19 @@ probe does not look for networks at all, see [the dongle](dongle/README.md#chann
 are tried in the order of saving when no saved network is in sight. While the access point is up, MCUViewer and GDB also work
 over it, at 192.168.4.1.
 
-To forget all saved networks, hold the BOOT button (GPIO0, see
-`CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO`) for 3 s while the probe runs. It restarts in setup
-mode, or joins the default network if one is built in. In field mode the same hold leaves field
-mode instead, see below. Do not hold BOOT while powering up: that starts the ESP32-S3's download
-mode.
+### The BOOT button
+
+The BOOT button (GPIO0, see `CONFIG_NETWORK_PROBE_SETUP_BUTTON_GPIO`) acts when you let go of it,
+by how long it was held; the LED shows what letting go would do:
+
+- **a short press** accepts the pairing request of an [ESP-NOW dongle](dongle/README.md#pairing);
+- **3 to 10 s** forgets all saved networks: the probe restarts in setup mode, or joins the default
+  network if one is built in. In field mode it leaves field mode instead, see below. The paired
+  dongles stay;
+- **10 s or more**, then a short press within 5 s, forgets every paired dongle. Without the short
+  press nothing happens.
+
+Do not hold BOOT while powering up: that starts the ESP32-S3's download mode.
 
 ### Field mode
 
@@ -121,12 +134,15 @@ Where there is no network, such as on a robot out in the field, the probe can do
 check *Field mode*, pick a channel and save. The probe restarts, joins no network and looks for
 none, and keeps its radio on that channel, so a dongle finds it at any time. Several probes in
 field mode work side by side; give each its own channel, 1, 6 or 11, so they do not share
-airtime. Field mode has no access point either: to leave it, hold the BOOT button for 3 s, and
-the probe restarts as before, with its saved networks.
+airtime. Field mode has no access point either: to leave it, hold the BOOT button for 3 s and let
+go, and the probe restarts as before, with its saved networks.
 
 The setup page is there in setup mode: out where no saved network is in reach, the probe opens it
 by itself 15 s after starting. The same section of the page turns ESP-NOW off, so that no dongle
 reaches the probe; field mode needs it on.
+
+Out of the box any dongle in range reaches the probe. [Pair](dongle/README.md#pairing) yours with
+it, and only paired dongles do, over an encrypted link.
 
 The setup access point is open unless `CONFIG_NETWORK_PROBE_AP_PASSWORD` is set (at least 8
 characters).

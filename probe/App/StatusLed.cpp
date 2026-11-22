@@ -38,6 +38,8 @@ constexpr int64_t activityGapMs = 100; /**< ...at most this often, so a stream o
 constexpr float activityLevel = 0.05f;
 
 constexpr int64_t identifyMs = 2000;
+constexpr int64_t pairedFlashMs = 150;
+constexpr int64_t pairedFlashes = 3;
 
 struct Color
 {
@@ -66,6 +68,7 @@ constexpr Color orange = {255, 64, 0};
 constexpr Color amber = {255, 140, 0};
 constexpr Color red = {255, 0, 0};
 constexpr Color white = {255, 255, 255};
+constexpr Color yellow = {255, 210, 0};
 
 /**
  * @brief An alert: count blinks, onMs of every periodMs lit.
@@ -90,7 +93,11 @@ constexpr AlertLook alertLooks[] = {
 std::atomic<StatusLed::Network> network{StatusLed::Network::connecting};
 std::atomic<bool> hostConnected{false};
 std::atomic<bool> gdbConnected{false};
+std::atomic<StatusLed::Hold> buttonHold{StatusLed::Hold::none};
 std::atomic<uint32_t> buttonRemainingMs{0};
+std::atomic<bool> eraseArmed{false};
+std::atomic<bool> pairingRequest{false};
+std::atomic<bool> pairedPending{false};
 std::atomic<bool> activityPending{false};
 std::atomic<bool> identifyPending{false};
 std::atomic<StatusLed::Alert> pendingAlert{StatusLed::Alert::none}; /**< The most severe since the LED task looked. */
@@ -105,6 +112,8 @@ int64_t activityDipEnd = 0;
 int64_t nextActivity = 0;
 int64_t identifyStart = 0;
 int64_t identifyEnd = 0;
+int64_t pairedStart = 0;
+int64_t pairedEnd = 0;
 float holdPhase = 0.0f; /**< Of the button hold blinks, 0 to 1. */
 
 /* A WS2812 bit: high, then low */
@@ -216,8 +225,20 @@ void updateIdentify(const int64_t nowMs)
 	identifyEnd = nowMs + identifyMs;
 }
 
-Look buttonLook(const uint32_t remainingMs)
+void updatePaired(const int64_t nowMs)
 {
+	if (!pairedPending.exchange(false, std::memory_order_relaxed))
+		return;
+	pairedStart = nowMs;
+	pairedEnd = nowMs + 2 * pairedFlashMs * pairedFlashes;
+}
+
+Look buttonLook(const int64_t nowMs, const StatusLed::Hold hold, const uint32_t remainingMs)
+{
+	if (hold == StatusLed::Hold::networks)
+		return {white, 1.0f};
+	if (hold == StatusLed::Hold::erase)
+		return {red, blink(nowMs, 60, 120)};
 	/* Twice a second when pressed, about 12 times a second at the end */
 	const float periodMs = std::clamp(static_cast<float>(remainingMs) / 6.0f, 80.0f, 500.0f);
 	holdPhase += static_cast<float>(tickMs) / periodMs;
@@ -252,11 +273,19 @@ Look render(const int64_t nowMs)
 	updateAlert(nowMs);
 	updateActivity(nowMs);
 	updateIdentify(nowMs);
+	updatePaired(nowMs);
 
-	const uint32_t remainingMs = buttonRemainingMs.load(std::memory_order_relaxed);
-	if (remainingMs)
-		return buttonLook(remainingMs);
+	const StatusLed::Hold hold = buttonHold.load(std::memory_order_relaxed);
+	if (hold != StatusLed::Hold::none)
+		return buttonLook(nowMs, hold, buttonRemainingMs.load(std::memory_order_relaxed));
 	holdPhase = 0.0f;
+
+	if (eraseArmed.load(std::memory_order_relaxed))
+		return {nowMs % 300 < 150 ? red : white, 1.0f};
+	if (nowMs < pairedEnd)
+		return {green, blink(nowMs - pairedStart, pairedFlashMs, 2 * pairedFlashMs)};
+	if (pairingRequest.load(std::memory_order_relaxed))
+		return {yellow, blink(nowMs, 150, 300)};
 
 	if (nowMs < identifyEnd)
 		return {white, blink(nowMs - identifyStart, 100, 200)};
@@ -322,9 +351,25 @@ void StatusLed::setGdbConnected(const bool connected)
 	gdbConnected.store(connected, std::memory_order_relaxed);
 }
 
-void StatusLed::setButtonHold(const uint32_t remainingMs)
+void StatusLed::setButtonHold(const Hold hold, const uint32_t remainingMs)
 {
 	buttonRemainingMs.store(remainingMs, std::memory_order_relaxed);
+	buttonHold.store(hold, std::memory_order_relaxed);
+}
+
+void StatusLed::setEraseArmed(const bool armed)
+{
+	eraseArmed.store(armed, std::memory_order_relaxed);
+}
+
+void StatusLed::setPairingRequest(const bool waiting)
+{
+	pairingRequest.store(waiting, std::memory_order_relaxed);
+}
+
+void StatusLed::paired()
+{
+	pairedPending.store(true, std::memory_order_relaxed);
 }
 
 void StatusLed::identify()

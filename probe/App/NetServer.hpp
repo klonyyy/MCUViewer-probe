@@ -12,9 +12,11 @@
 #include <array>
 
 #include "EspNowLink.hpp"
+#include "EspNowPairing.hpp"
 #include "EspNowPort.hpp"
 #include "HostLink.hpp"
 #include "NetworkProbeProto.hpp"
+#include "Pairing.hpp"
 #include "SwoCapture.hpp"
 
 class Wifi;
@@ -33,6 +35,11 @@ class Wifi;
  * dropped by their seq, and a frame goes only while the dongle's limit allows it, as over TCP while the window does.
  * Packets of a session the probe does not serve get CLOSE back. While a session lasts, it holds the radio on its
  * channel (Wifi::holdRadio()).
+ *
+ * Pairing (Pairing, EspNowPairing.hpp): once paired, the probe takes sessions from its paired dongles only, and checks
+ * the tag of every packet of theirs (SessionAuth); the pairing requests and the BOOT button's presses come here, and
+ * so do PAIRINGS and UNPAIR, which only the session of a paired dongle may send. Packets with session 0 go out as
+ * broadcasts addressed to their dongle, so whatever the dongle's pairing, it reads them.
  *
  * SWO needs no SWD, so the net task owns the SWO capture: it answers SWO_START and SWO_STOP itself, and sends the
  * captured bytes in SWO_DATA frames, taking turns with DATA.
@@ -57,7 +64,7 @@ class NetServer
 	void start(HostLink& hostLink, int gdbListenSocket, SwoCapture& swoCapture, Wifi& network);
 
    private:
-	static constexpr uint32_t taskStackSize = 6144;
+	static constexpr uint32_t taskStackSize = 8192; /**< X25519 of a pairing runs in it. */
 	static constexpr uint32_t taskPriority = 5;
 	static constexpr int taskCore = 0;				   /**< With Wi-Fi and lwIP; core 1 belongs to SWD. */
 	static constexpr size_t dataTargetPayload = 1400;  /**< A DATA frame fills about one TCP segment. */
@@ -100,7 +107,17 @@ class NetServer
 	 */
 	void serviceEspNow();
 	void handlePacket(const EspNowPort::Packet& packet);
-	void openEspNowSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader);
+
+	/**
+	 * @brief A packet with session 0 for this probe: discovery or pairing.
+	 */
+	void handleUnsessioned(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader);
+
+	/**
+	 * @brief A packet of a session the probe does not serve: it may start one, or gets CLOSE.
+	 */
+	void handleOtherSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader);
+	void openEspNowSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader, const EspNowLink::SessionAuth& auth);
 
 	/**
 	 * @return Whether a packet of a session the probe does not serve may start one: the first DATA, or a PING before
@@ -109,9 +126,30 @@ class NetServer
 	bool mayOpenSession(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader) const;
 
 	/**
-	 * @brief Answers a packet of a session the probe does not serve with CLOSE, so its dongle ends it.
+	 * @brief Answers a packet of a session the probe does not serve with CLOSE, so its dongle ends it; a paired dongle's
+	 * only when it is a PING with the session's tag, the one packet of a session not served whose tag can be checked.
+	 * @param pairKey The dongle's, or nullptr.
+	 * @param why For the log.
 	 */
-	void refuseSession(const uint8_t* mac, uint16_t session);
+	void refuseIfAuthentic(const EspNowPort::Packet& packet, const EspNowLink::Header& linkHeader, const uint8_t* pairKey, const char* why);
+	void refuseSession(const uint8_t* mac, uint16_t session, const uint8_t* pairKey, const char* why);
+
+	/**
+	 * @brief The BOOT button's presses, and the pairing's timeouts.
+	 */
+	void servicePairing(int64_t now);
+
+	/**
+	 * @brief A dongle got paired: the probe is locked now, so a session of an unpaired dongle ends, and so does one of
+	 * this dongle, which ended it on its side to pair.
+	 */
+	void onPaired(const uint8_t* mac);
+
+	/**
+	 * @brief Answers PAIRINGS or UNPAIR.
+	 * @return False when the client broke the protocol.
+	 */
+	bool handlePairingRequest(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
 
 	/**
 	 * @brief Checks that data holds exactly one frame, with a valid CRC.
@@ -120,9 +158,10 @@ class NetServer
 
 	/**
 	 * @brief Prepares the answer to a DISCOVER, or to an IDENTIFY with this probe's id, in discoveryFrame.
+	 * @param dongleMac The dongle that asked, for the pairing byte; nullptr over UDP.
 	 * @return Size of the answer, or 0 when there is none.
 	 */
-	size_t answerDiscovery(const NetworkProbe::FrameHeader& header, const uint8_t* payload);
+	size_t answerDiscovery(const NetworkProbe::FrameHeader& header, const uint8_t* payload, const uint8_t* dongleMac);
 
 	/**
 	 * @brief Opens the UDP discovery port. Without it the probe works, but hosts have to know its address.
@@ -135,7 +174,7 @@ class NetServer
 	 */
 	void answerDatagram();
 
-	uint16_t buildDiscover(uint8_t* data) const;
+	uint16_t buildDiscover(uint8_t* data, const uint8_t* dongleMac) const;
 
 	/**
 	 * @brief Receives what the client sent and handles every complete frame.
@@ -226,13 +265,16 @@ class NetServer
 	uint16_t sessionMaxPayload = HostLink::maxPayload;
 	uint16_t sessionMaxRead = HostLink::maxRead;
 
+	Pairing pairing;
+
 	/* The ESP-NOW client, and the last ESP-NOW session that ended, whose packets are dropped */
 	uint8_t espnowPeer[6] = {};
 	uint16_t espnowSession = EspNowLink::noSession;
-	uint16_t espnowTxSeq = 1; /**< seq of the next DATA sent. */
-	uint16_t espnowRxSeq = 0; /**< seq of the last DATA taken. */
-	uint16_t espnowLimit = 0; /**< The dongle's: the last seq it has room for. */
+	EspNowLink::SessionAuth espnowAuth; /**< Tags, and the seq of the last DATA taken. */
+	uint32_t espnowTxNumber = 1;		/**< Of the next DATA sent: its seq is the lower half. */
+	uint16_t espnowLimit = 0;			/**< The dongle's: the last seq it has room for. */
 	int64_t espnowLastRx = 0;
+	bool espnowDropReported = false; /**< A packet of the session with a wrong tag or seq was logged. */
 	uint8_t endedPeer[6] = {};
 	uint16_t endedSession = EspNowLink::noSession;
 	uint8_t refusedPeer[6] = {}; /**< The last session refused, so it is logged once. */

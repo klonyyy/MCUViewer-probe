@@ -12,7 +12,11 @@
  * @brief The status LED: a WS2812 RGB LED, driven by RMT.
  *
  * It shows the first of these that applies:
- * - the setup button held: white blinks that speed up until the saved networks are forgotten, or field mode left;
+ * - the setup button held: white blinks that speed up for 3 s, then steady white (released now, the saved networks are
+ *   forgotten, or field mode left), from 10 s fast red blinks (released now, the pairings may be erased);
+ * - the pairing erase armed: red and white by turns, until a short press confirms it or 5 s pass;
+ * - a pairing done: three green flashes;
+ * - a pairing request: yellow blinks, until the BOOT button accepts it or 30 s pass;
  * - identification: fast white blinks for a few seconds, when a host asked which probe this is;
  * - an alert: one amber flash when samples or SWO bytes were dropped, one red flash when an access to the target
  *   failed, red blinks when the target was lost or a Wi-Fi join failed;
@@ -56,11 +60,35 @@ class StatusLed
 	static void setHostConnected(bool connected);
 	static void setGdbConnected(bool connected);
 
+	/** What releasing the held setup button would do. */
+	enum class Hold : uint8_t
+	{
+		none,	  /**< Released. */
+		counting, /**< Nothing yet. */
+		networks, /**< Forget the saved networks, or leave field mode. */
+		erase,	  /**< Arm the pairing erase. */
+	};
+
 	/**
 	 * @brief Shows that the setup button is held.
-	 * @param remainingMs Until the hold takes effect; 0 when the button is released.
+	 * @param remainingMs While counting: until the hold reaches networks.
 	 */
-	static void setButtonHold(uint32_t remainingMs);
+	static void setButtonHold(Hold hold, uint32_t remainingMs = 0);
+
+	/**
+	 * @brief The pairing erase waits for a short press, or not any more.
+	 */
+	static void setEraseArmed(bool armed);
+
+	/**
+	 * @brief A dongle waits for the BOOT button to accept its pairing, or not any more.
+	 */
+	static void setPairingRequest(bool waiting);
+
+	/**
+	 * @brief A dongle got paired: three green flashes.
+	 */
+	static void paired();
 
 	/**
 	 * @brief Blinks the LED white for a few seconds, so the user can tell this probe from the others. A call while it
