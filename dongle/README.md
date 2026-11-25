@@ -63,7 +63,10 @@ To unpair, the probe forgets the dongle first, in a session of that dongle (`UNP
 dongle at hand, hold the probe's BOOT button for 10 s and let go, then press it briefly within 5 s: it forgets every
 dongle and is open again.
 
-Until MCUViewer has a Pair button, a script does it:
+In MCUViewer, the NETWORK PROBE settings show the pairing of the picked probe under the probe list when the connection
+is *ESP-NOW dongle*, with **Pair** and **Unpair**. **Pairings...** lists the probes the dongle is paired with, in range
+or not, and the dongles a paired probe in range is paired with, where a lost one can be forgotten. A script does the
+same:
 
 ```
 python Tools/dongle_pair.py COM7 list
@@ -100,7 +103,8 @@ They reset over and over at the edge of range. See
 
 ## Trying it
 
-MCUViewer does not speak to the dongle yet. The timing test does:
+In MCUViewer, pick *ESP-NOW dongle* as the connection of the NETWORK PROBE in the acquisition settings. The timing test
+runs through the dongle too:
 
 ```
 pip install pyserial

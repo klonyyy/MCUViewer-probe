@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Piotr Wasilewski
 # SPDX-License-Identifier: MIT
 """
-Pairing of ESP-NOW dongles and probes, through a dongle on a serial port, until MCUViewer does it (needs pyserial):
+Pairing of ESP-NOW dongles and probes, through a dongle on a serial port, as MCUViewer's pairing controls do it
+(needs pyserial):
 
     python Tools/dongle_pair.py COM7 list                        probes in range, and the dongle's pairings
     python Tools/dongle_pair.py COM7 pair network-probe-a1b2c3   then press the probe's BOOT button briefly
